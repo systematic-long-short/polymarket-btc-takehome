@@ -1,0 +1,30 @@
+# --- Python ---
+__pycache__/
+*.py[cod]
+*.egg-info/
+*.egg
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+build/
+dist/
+
+# --- Virtual envs ---
+.venv/
+venv/
+env/
+
+# --- Editor / OS ---
+.vscode/
+.idea/
+.DS_Store
+
+# --- polybench run outputs ---
+runs/
+*.parquet.tmp
+run_*.json
+
+# tests/fixtures/*.parquet is tracked (the committed replay fixtures).
+
+# --- Local candidate scratch dirs ---
+.polybench_scratch/

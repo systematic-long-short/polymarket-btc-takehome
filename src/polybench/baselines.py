@@ -1,57 +1,19 @@
-"""Reference baseline models.
+"""Reference baseline — the single model every candidate is scored against.
 
-Candidates should measurably beat ``MomentumBaseline`` on risk-adjusted return
-(Sharpe × sign(PnL)) to pass. ``RandomModel`` is the floor; ``AlwaysUpModel``
-calibrates how much of any reported PnL is ambient market drift.
+The harness always runs ``MomentumBaseline`` in parallel with the candidate's
+submission on the same tape, and the report prints both side-by-side. To
+pass, the candidate must materially beat this baseline on the primary score
+(``PnL × Sharpe × (1 − max_drawdown)``).
 """
 
 from __future__ import annotations
 
 import logging
-import random
 from typing import Any
 
 from polybench.model import FLAT, MarketInfo, Model, Side, Signal, Tick
 
 log = logging.getLogger("polybench.baselines")
-
-
-class RandomModel(Model):
-    """Pick UP, DOWN, or FLAT uniformly at random every tick.
-
-    Expected PnL ≈ 0 across a long run; high variance. Useful as a sanity
-    floor — any real signal should dominate this.
-    """
-
-    def __init__(self, config: dict[str, Any] | None = None) -> None:
-        super().__init__(config=config)
-        seed = self.config.get("seed", 0)
-        self._rng = random.Random(seed)
-        self._size = float(self.config.get("size", 0.5))
-
-    def on_tick(self, tick: Tick) -> Signal | None:
-        choice = self._rng.randint(0, 2)
-        if choice == 0:
-            return Signal(side=Side.UP, size=self._size, confidence=0.33)
-        if choice == 1:
-            return Signal(side=Side.DOWN, size=self._size, confidence=0.33)
-        return FLAT
-
-
-class AlwaysUpModel(Model):
-    """Buy UP at the first tick of every event, hold to resolution.
-
-    This calibrates the "ambient up-drift + hold-to-settle" PnL a trader
-    inherits without any signal. A model that only narrowly beats this is
-    probably not capturing useful structure.
-    """
-
-    def __init__(self, config: dict[str, Any] | None = None) -> None:
-        super().__init__(config=config)
-        self._size = float(self.config.get("size", 1.0))
-
-    def on_tick(self, tick: Tick) -> Signal | None:
-        return Signal(side=Side.UP, size=self._size, confidence=1.0)
 
 
 class MomentumBaseline(Model):
@@ -82,8 +44,8 @@ class MomentumBaseline(Model):
         if len(window) < 2:
             return FLAT
         # Use the sample from ``_lookback_s`` seconds ago — approximated by
-        # index offset assuming 1 Hz samples (which matches the price feed's
-        # default window rate on Binance/Coinbase tickers).
+        # index offset assuming 1 Hz samples (which matches the harness's
+        # 1 Hz btc_recent window).
         offset = min(len(window) - 1, self._lookback_s)
         past = window[-1 - offset]
         now_price = window[-1]

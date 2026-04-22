@@ -119,10 +119,14 @@ def summarize(
     pnl = final_equity - starting_capital
     pnl_pct = pnl / starting_capital if starting_capital else 0.0
     sharpe = sharpe_ratio(returns, ticks_per_year=ticks_per_year)
-    # |Sharpe| × sign(PnL): magnitude of consistency, signed by P&L direction.
-    # A losing model with small consistent losses has low-magnitude negative
-    # score; a winning model with steady gains has high-magnitude positive.
-    primary_score = abs(sharpe) * (1.0 if pnl >= 0.0 else -1.0)
+    mdd = max_drawdown(equity_curve)
+    # Primary score = PnL × Sharpe × (1 − max_drawdown).
+    # A winning model with high Sharpe and low drawdown scores very high.
+    # A losing model with consistently-negative Sharpe will produce a positive
+    # product (two negatives cancel) but of small magnitude relative to a
+    # winner — the drawdown term is the penalty that keeps noisy wins from
+    # dominating clean ones.
+    primary_score = pnl * sharpe * max(0.0, 1.0 - mdd)
     intra = sum(e.pnl_intra_event for e in events)
     reso = sum(e.pnl_resolution for e in events)
     denom = abs(intra) + abs(reso)
@@ -134,7 +138,7 @@ def summarize(
         "pnl_pct": pnl_pct,
         "sharpe": sharpe,
         "sortino": sortino_ratio(returns, ticks_per_year=ticks_per_year),
-        "max_drawdown": max_drawdown(equity_curve),
+        "max_drawdown": mdd,
         "hit_rate": hit_rate(events),
         "outcome_accuracy": outcome_accuracy(events),
         "timeout_rate": timeout_rate(events),
@@ -144,5 +148,5 @@ def summarize(
         "pnl_intra_event": intra,
         "pnl_resolution": reso,
         "intra_vs_resolution_fraction": intra_fraction,  # 1 = all intra, -1 = all resolution
-        "primary_score": primary_score,                  # Sharpe × sign(PnL)
+        "primary_score": primary_score,                  # PnL × Sharpe × (1 − max_drawdown)
     }

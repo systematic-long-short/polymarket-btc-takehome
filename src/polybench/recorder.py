@@ -23,6 +23,8 @@ Schema (one row per tick):
     equity               float64
     fills_this_tick      int64
     timeout              bool      True if on_tick overran 500 ms
+    baseline_*           (same shape as above for the MomentumBaseline
+                          track run in parallel on the same tape)
     resolution_up        float64   NaN except on the settlement row
     resolution_down      float64   NaN except on the settlement row
     resolved_outcome     string    "UP" | "DOWN" | "UNKNOWN" | ""
@@ -65,6 +67,18 @@ class TickRow:
     equity: float = 0.0
     fills_this_tick: int = 0
     timeout: bool = False
+    # Parallel baseline track — same columns for the MomentumBaseline run on
+    # the same tape. Identical to the model columns when the caller's model
+    # IS MomentumBaseline.
+    baseline_signal_side: str = "NONE"
+    baseline_signal_size: float = 0.0
+    baseline_signal_confidence: float = 0.0
+    baseline_position_up: float = 0.0
+    baseline_position_down: float = 0.0
+    baseline_cash: float = 0.0
+    baseline_equity: float = 0.0
+    baseline_fills_this_tick: int = 0
+    baseline_timeout: bool = False
     resolution_up: float = float("nan")
     resolution_down: float = float("nan")
     resolved_outcome: str = ""
@@ -109,11 +123,11 @@ class Recorder:
 
 
 def _default_for(column: str) -> Any:
-    if column in {"event_id", "slug", "signal_side", "resolved_outcome"}:
-        return "NONE" if column == "signal_side" else ""
-    if column == "timeout":
+    if column in {"event_id", "slug", "signal_side", "baseline_signal_side", "resolved_outcome"}:
+        return "NONE" if column in {"signal_side", "baseline_signal_side"} else ""
+    if column in {"timeout", "baseline_timeout"}:
         return False
-    if column == "fills_this_tick":
+    if column in {"fills_this_tick", "baseline_fills_this_tick"}:
         return 0
     if column in {"resolution_up", "resolution_down"}:
         return math.nan

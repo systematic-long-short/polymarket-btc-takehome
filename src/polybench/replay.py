@@ -28,6 +28,7 @@ log = logging.getLogger("polybench.replay")
 class ReplayConfig:
     starting_capital: float = 1000.0
     slippage_bps: float = 200.0
+    fee_rate: float = 0.072
     model_budget_s: float = 0.5
     output_dir: Path = Path("runs/replay")
     scratch_dir: Path = Path("runs/replay/scratch")
@@ -40,12 +41,17 @@ def replay(
     parquet_path: Path | str,
     config: ReplayConfig | None = None,
     on_summary: Callable[[str], None] | None = None,
+    baseline_model: Model | None = None,
 ) -> RunResult:
     cfg = config or ReplayConfig()
     cfg.output_dir = Path(cfg.output_dir)
     cfg.scratch_dir = Path(cfg.scratch_dir)
     cfg.output_dir.mkdir(parents=True, exist_ok=True)
     cfg.scratch_dir.mkdir(parents=True, exist_ok=True)
+
+    if baseline_model is None:
+        from polybench.baselines import MomentumBaseline
+        baseline_model = MomentumBaseline()
 
     df = pd.read_parquet(Path(parquet_path), engine="pyarrow")
     if df.empty:
@@ -54,13 +60,30 @@ def replay(
     simulator = PaperSimulator(
         starting_capital=cfg.starting_capital,
         slippage_bps=cfg.slippage_bps,
+        fee_rate=cfg.fee_rate,
+    )
+    baseline_simulator = PaperSimulator(
+        starting_capital=cfg.starting_capital,
+        slippage_bps=cfg.slippage_bps,
+        fee_rate=cfg.fee_rate,
     )
     btc_window: deque[float] = deque(maxlen=cfg.price_window_size)
     up_mid_window: deque[float] = deque(maxlen=cfg.up_mid_window_size)
     equity_curve: list[float] = []
+    baseline_equity_curve: list[float] = []
     current_event: str | None = None
 
     started_ts = float(df["ts"].iloc[0])
+
+    def _safe_on_tick(m: Model, t: Tick) -> Signal | None:
+        try:
+            sig = m.on_tick(t)
+        except Exception:  # noqa: BLE001
+            log.exception("%s.on_tick raised during replay", type(m).__name__)
+            return None
+        if sig is not None and not isinstance(sig, Signal):
+            return None
+        return sig
 
     for row in df.itertuples(index=False):
         event_id = str(getattr(row, "event_id", "") or "")
@@ -71,12 +94,19 @@ def replay(
 
         # Event rollover detection.
         if event_id and event_id != current_event:
-            # Close prior (if any) as unresolved before starting next.
             if current_event is not None:
                 simulator.finish_event(float(row.ts), None, None)
+                baseline_simulator.finish_event(float(row.ts), None, None)
             current_event = event_id
             up_mid_window.clear()
             simulator.start_event(
+                event_id=event_id,
+                slug=slug,
+                ts=float(row.ts),
+                up_mid=float(row.up_mid) or 0.5,
+                down_mid=float(row.down_mid) or 0.5,
+            )
+            baseline_simulator.start_event(
                 event_id=event_id,
                 slug=slug,
                 ts=float(row.ts),
@@ -96,11 +126,16 @@ def replay(
                 model.on_start(market_info)
             except Exception:  # noqa: BLE001
                 log.exception("model.on_start raised during replay")
+            try:
+                baseline_model.on_start(market_info)
+            except Exception:  # noqa: BLE001
+                log.exception("baseline_model.on_start raised during replay")
 
         if is_settlement_row and current_event is not None:
             up_price = float(row.resolution_up)
             down_price = float(row.resolution_down)
             simulator.finish_event(float(row.ts), up_price, down_price)
+            baseline_simulator.finish_event(float(row.ts), up_price, down_price)
             current_event = None
             continue
 
@@ -129,35 +164,44 @@ def replay(
             event_id=event_id,
         )
 
-        try:
-            signal_out = model.on_tick(tick)
-        except Exception:  # noqa: BLE001
-            log.exception("model.on_tick raised during replay")
-            signal_out = None
-
-        if signal_out is not None and not isinstance(signal_out, Signal):
-            signal_out = None
+        signal_out = _safe_on_tick(model, tick)
+        baseline_signal_out = _safe_on_tick(baseline_model, tick)
 
         up_top = BookTop(best_bid=tick.up_bid, best_ask=tick.up_ask, mid=tick.up_mid)
         down_top = BookTop(best_bid=tick.down_bid, best_ask=tick.down_ask, mid=tick.down_mid)
         simulator.apply_signal(signal_out, up_top, down_top)
         equity = simulator.mark_to_market(up_top, down_top, tick.ts)
         equity_curve.append(equity)
+        baseline_simulator.apply_signal(baseline_signal_out, up_top, down_top)
+        baseline_equity = baseline_simulator.mark_to_market(up_top, down_top, tick.ts)
+        baseline_equity_curve.append(baseline_equity)
 
     # Close dangling event if any (unresolved at EOF).
     if current_event is not None:
         simulator.finish_event(float(df["ts"].iloc[-1]), None, None)
+        baseline_simulator.finish_event(float(df["ts"].iloc[-1]), None, None)
+
+    def _final_equity(sim, curve):
+        if abs(sim.position.cash) > 1e-9:
+            return sim.position.cash
+        return curve[-1] if curve else sim.starting_capital
 
     ended_ts = float(df["ts"].iloc[-1])
     starting = simulator.starting_capital
-    final_equity = (
-        simulator.position.cash if abs(simulator.position.cash) > 1e-9 else (equity_curve[-1] if equity_curve else starting)
-    )
+    final_equity = _final_equity(simulator, equity_curve)
+    baseline_final_equity = _final_equity(baseline_simulator, baseline_equity_curve)
+
     metrics = summarize(
         starting_capital=starting,
         final_equity=final_equity,
         equity_curve=[starting, *equity_curve],
         events=simulator.completed_events,
+    )
+    baseline_metrics = summarize(
+        starting_capital=starting,
+        final_equity=baseline_final_equity,
+        equity_curve=[starting, *baseline_equity_curve],
+        events=baseline_simulator.completed_events,
     )
     result = RunResult(
         started_ts=started_ts,
@@ -168,23 +212,41 @@ def replay(
         pnl_pct=(final_equity - starting) / starting if starting else 0.0,
         events=simulator.completed_events,
         metrics=metrics,
+        baseline_events=baseline_simulator.completed_events,
+        baseline_metrics=baseline_metrics,
+        baseline_final_equity=baseline_final_equity,
+        baseline_pnl_total=baseline_final_equity - starting,
+        baseline_pnl_pct=(
+            (baseline_final_equity - starting) / starting if starting else 0.0
+        ),
     )
     try:
         model.on_finish(result)
     except Exception:  # noqa: BLE001
         log.exception("model.on_finish raised during replay")
 
-    # Write a report next to the input for easy inspection.
+    # Write the two-column report next to the input.
     report_path = cfg.output_dir / "report.json"
     payload: dict[str, Any] = {
         "started_ts": result.started_ts,
         "ended_ts": result.ended_ts,
         "starting_capital": result.starting_capital,
-        "final_equity": result.final_equity,
-        "pnl_total": result.pnl_total,
-        "pnl_pct": result.pnl_pct,
-        "metrics": result.metrics,
-        "events": [asdict(e) if is_dataclass(e) else dict(e) for e in result.events],
+        "model": {
+            "final_equity": result.final_equity,
+            "pnl_total": result.pnl_total,
+            "pnl_pct": result.pnl_pct,
+            "metrics": result.metrics,
+            "events": [asdict(e) if is_dataclass(e) else dict(e) for e in result.events],
+        },
+        "baseline": {
+            "final_equity": result.baseline_final_equity,
+            "pnl_total": result.baseline_pnl_total,
+            "pnl_pct": result.baseline_pnl_pct,
+            "metrics": result.baseline_metrics,
+            "events": [
+                asdict(e) if is_dataclass(e) else dict(e) for e in result.baseline_events
+            ],
+        },
     }
     report_path.write_text(json.dumps(payload, indent=2, default=str))
 

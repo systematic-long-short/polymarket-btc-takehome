@@ -1,13 +1,12 @@
-"""Reference baselines — the three benchmarks a candidate is compared against.
+"""The single reference baseline — every candidate is scored against this.
 
-Implementations live in ``polybench.baselines``; this file re-exports them
-so candidates can read a single short file to see what "good" looks like.
+Implementation lives in ``polybench.baselines``; this file re-exports it so
+candidates can read a short file to see exactly what they're benchmarked
+against.
 
-    RandomModel       — floor; picks UP / DOWN / FLAT uniformly at random
-    AlwaysUpModel     — buy UP, hold to resolution
-    MomentumBaseline  — 30s BTC momentum, trades dynamically — THE BAR
+    MomentumBaseline — 30s BTC momentum, trades dynamically — THE BAR.
 """
 
-from polybench.baselines import AlwaysUpModel, MomentumBaseline, RandomModel
+from polybench.baselines import MomentumBaseline
 
-__all__ = ["AlwaysUpModel", "MomentumBaseline", "RandomModel"]
+__all__ = ["MomentumBaseline"]

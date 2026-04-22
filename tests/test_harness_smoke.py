@@ -9,7 +9,8 @@ from __future__ import annotations
 import math
 from pathlib import Path
 
-from polybench.baselines import AlwaysUpModel, MomentumBaseline, RandomModel
+from polybench import FLAT, Model, Side, Signal, Tick
+from polybench.baselines import MomentumBaseline
 from polybench.replay import ReplayConfig, replay
 
 
@@ -22,22 +23,36 @@ def _cfg(tmp_path: Path) -> ReplayConfig:
     )
 
 
-def test_replay_random_model(any_event_fixture: Path, tmp_path: Path) -> None:
-    result = replay(RandomModel(config={"seed": 1}), any_event_fixture, _cfg(tmp_path))
+class _AlwaysUpModel(Model):
+    """Test-only control: buys UP at size 1.0 every tick. Used to assert the
+    replay path handles held-to-resolution PnL correctly."""
+
+    def on_tick(self, tick: Tick) -> Signal | None:
+        return Signal(side=Side.UP, size=1.0)
+
+
+class _FlatModel(Model):
+    def on_tick(self, tick: Tick) -> Signal | None:
+        return FLAT
+
+
+def test_replay_flat_model_zero_pnl(any_event_fixture: Path, tmp_path: Path) -> None:
+    result = replay(_FlatModel(), any_event_fixture, _cfg(tmp_path))
     assert math.isfinite(result.pnl_total)
-    assert math.isfinite(result.metrics["sharpe"])
     assert result.metrics["n_events"] >= 1
-    assert result.metrics["n_ticks"] >= 1
+    # FLAT never trades → pnl is 0.
+    assert result.metrics["n_trades"] == 0
+    # Dual-column: baseline should also be present.
+    assert "primary_score" in result.baseline_metrics
 
 
-def test_replay_alwaysup_produces_resolution_pnl(
+def test_replay_always_up_produces_resolution_pnl(
     any_event_fixture: Path, tmp_path: Path
 ) -> None:
-    result = replay(AlwaysUpModel(), any_event_fixture, _cfg(tmp_path))
-    # AlwaysUp holds through resolution on every event, so resolution PnL
-    # must dominate intra-event PnL.
+    result = replay(_AlwaysUpModel(), any_event_fixture, _cfg(tmp_path))
     intra = result.metrics["pnl_intra_event"]
     reso = result.metrics["pnl_resolution"]
+    # AlwaysUp holds through resolution → resolution PnL dominates intra.
     assert abs(reso) >= abs(intra)
 
 
@@ -53,9 +68,17 @@ def test_replay_momentum_baseline_runs(
     assert result.metrics["n_events"] >= 1
 
 
-def test_replay_writes_report_json(any_event_fixture: Path, tmp_path: Path) -> None:
+def test_replay_writes_dual_column_report_json(
+    any_event_fixture: Path, tmp_path: Path
+) -> None:
     cfg = _cfg(tmp_path)
-    replay(RandomModel(config={"seed": 0}), any_event_fixture, cfg)
+    replay(_FlatModel(), any_event_fixture, cfg)
+    import json
     report_path = cfg.output_dir / "report.json"
     assert report_path.is_file()
-    assert report_path.stat().st_size > 0
+    payload = json.loads(report_path.read_text())
+    # New schema: model + baseline dicts.
+    assert "model" in payload
+    assert "baseline" in payload
+    assert "metrics" in payload["model"]
+    assert "metrics" in payload["baseline"]

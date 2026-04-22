@@ -164,12 +164,29 @@ scanner rejects it statically.
 
 ## How scoring works
 
-**Primary metric — raw PnL.**
+**Primary score:** `PnL × Sharpe × (1 − max_drawdown)`. Bigger is better.
 
-PnL is computed mark-to-market, tick by tick. When you send a signal we
-execute the delta against the current Polymarket order book: buys at
-`best_ask * (1 + slippage)`, sells at `best_bid * (1 - slippage)` with a
-default 2% slippage to approximate friction. Your equity each tick is
+- `PnL` is total dollars made over the run (final equity minus starting capital).
+- `Sharpe` is annualized on tick-level returns. Consistency matters.
+- `max_drawdown` is the worst peak-to-trough drawdown seen during the run,
+  as a fraction in `[0, 1]`. The `(1 − max_drawdown)` multiplier penalizes
+  volatile wins: a strategy that earns $100 cleanly beats one that earns
+  the same $100 after a 40% intra-run drawdown.
+
+**How PnL is computed.** PnL is mark-to-market, tick by tick. When you
+send a signal, the simulator executes the delta against the current
+Polymarket order book:
+
+- Buys fill at `best_ask × (1 + slippage)` (default slippage 2%).
+- Sells fill at `best_bid × (1 − slippage)`.
+- Every fill also pays a Polymarket-style fee of
+  `|notional| × fee_rate × p × (1 − p)` where `p` is the fill price in
+  `[0, 1]` and `fee_rate = 0.072` by default. Fee is maximal at
+  `p = 0.5` (~1.8% of notional) and collapses toward zero at the
+  extremes — buying a near-certain outcome costs very little, taking a
+  coin-flip position costs more.
+
+Your equity each tick is
 `cash + up_shares × up_mid + down_shares × down_mid`. At event end, any
 held shares settle at the resolved `outcomePrices` (typically `[1, 0]`
 or `[0, 1]`).
@@ -180,46 +197,36 @@ UP vs DOWN.** A candidate who buys UP at $0.40 and closes at $0.55
 captures $0.15/share of edge regardless of whether the event eventually
 resolves UP or DOWN.
 
-**Secondary metrics:**
+**Secondary metrics (recorded, not the gate):**
 
-- **Sharpe (annualized)** on tick-level returns. Consistency matters.
-- **Sortino** — same idea, downside-only.
-- **Max drawdown** — lower is better.
-- **Hit rate** — fraction of events closed with positive PnL. Recorded
-  but not a primary gate: it's possible (and fine!) to be "wrong" about
-  direction most of the time and still profit by entering well.
-- **Outcome accuracy** — fraction of events where your resolution-PnL
-  was positive. Tertiary — we record it to see if the signal has any
-  predictive power.
-- **PnL attribution** — each event's PnL is split into *intra-event*
-  (from closed price changes while held) and *resolution* (from the $1 /
-  $0 snap at settlement). Most of a strong candidate's PnL should come
-  from intra-event.
-
-**Primary score formula:** `|Sharpe| × sign(PnL)`. Magnitude scaled by
-direction — a winning model with high Sharpe scores highly positive; a
-losing model with high-consistency losses scores highly negative.
+- `sharpe` / `sortino` — annualized on tick-level returns.
+- `hit_rate` — fraction of events closed with positive PnL.
+- `outcome_accuracy` — fraction of events where your resolution-PnL was
+  positive.
+- `timeout_rate` — fraction of ticks where `on_tick` overran 500 ms.
+- PnL attribution — intra-event vs resolution split.
 
 ---
 
-## The three baselines you're compared against
+## The one baseline you're compared against
 
-These are run in the **same 2-hour window** as your submission.
+Every run prints a two-column report: **Model** (your submission) vs
+**Baseline** (`MomentumBaseline`), each paper-traded on the exact same
+tick stream. You can't cherry-pick a favorable window; the comparison is
+apples-to-apples per second.
 
-| Baseline            | What it does                                                                   | Expected performance |
-|---------------------|--------------------------------------------------------------------------------|----------------------|
-| `RandomModel`       | Uniformly random UP / DOWN / FLAT each tick                                    | Expected PnL ≈ 0     |
-| `AlwaysUpModel`     | Buys UP at first tick of every event, holds through resolution                 | Tracks ambient drift |
-| `MomentumBaseline`  | 30-second BTC momentum → UP/DOWN/FLAT with magnitude-scaled size, trades dynamically | **The bar.**   |
+- `MomentumBaseline` — 30-second BTC momentum → UP / DOWN / FLAT with
+  magnitude-scaled size, trades dynamically within each event. This is
+  THE BAR. To pass, your submission must materially beat it on the
+  primary score.
 
-**To pass, you must materially beat `MomentumBaseline` on primary score.**
-
-Run them yourself:
+Run the baseline solo to see what "the bar" is producing under current
+market conditions:
 
 ```bash
-python scripts/run_baseline.py --model momentum --duration 300
-python scripts/run_baseline.py --model random    --duration 300
-python scripts/run_baseline.py --model alwaysup --duration 300
+python scripts/run_baseline.py --duration 300
+# both Model and Baseline columns in the report are identical for this
+# call (you ran the baseline as your "model") — that's by design.
 ```
 
 ---

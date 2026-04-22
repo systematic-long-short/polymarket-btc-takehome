@@ -67,6 +67,7 @@ class Fill:
     shares_delta: float   # positive = buy, negative = sell
     fill_price: float
     notional: float       # signed: positive spent (buy), negative received (sell)
+    fee: float = 0.0      # always positive, deducted from cash on top of notional
 
 
 @dataclass
@@ -106,9 +107,11 @@ class PaperSimulator:
         self,
         starting_capital: float = 1000.0,
         slippage_bps: float = 200.0,   # 2% = 200 basis points
+        fee_rate: float = 0.072,        # Polymarket-style per-trade fee coefficient
     ) -> None:
         self._starting_capital = float(starting_capital)
         self._slippage = float(slippage_bps) / 10_000.0
+        self._fee_rate = float(fee_rate)
         self.position = Position(cash=self._starting_capital)
         self._current_event: _EventAcc | None = None
         self._completed_events: list[EventResult] = []
@@ -122,6 +125,10 @@ class PaperSimulator:
     @property
     def slippage_bps(self) -> float:
         return self._slippage * 10_000.0
+
+    @property
+    def fee_rate(self) -> float:
+        return self._fee_rate
 
     @property
     def completed_events(self) -> tuple[EventResult, ...]:
@@ -296,6 +303,7 @@ class PaperSimulator:
             fills.append(fill_up)
             self.position.up_shares += fill_up.shares_delta
             self.position.cash -= fill_up.notional
+            self.position.cash -= fill_up.fee
         fill_down = self._execute_leg(
             Side.DOWN,
             delta=target_down - self.position.down_shares,
@@ -305,6 +313,7 @@ class PaperSimulator:
             fills.append(fill_down)
             self.position.down_shares += fill_down.shares_delta
             self.position.cash -= fill_down.notional
+            self.position.cash -= fill_down.fee
         return fills
 
     def _execute_leg(self, side: Side, *, delta: float, book: BookTop) -> Fill | None:
@@ -322,4 +331,16 @@ class PaperSimulator:
                 return None
             fill_price = book.best_bid * (1.0 - self._slippage)
             notional = delta * fill_price                 # cash in (negative notional)
-        return Fill(side=side, shares_delta=delta, fill_price=fill_price, notional=notional)
+        # Polymarket-style fee: fee = |notional| * fee_rate * p * (1-p) where
+        # p = fill_price. Peaks at p=0.5 (maximum uncertainty), near-zero at
+        # the extremes. Always positive; deducted from cash on top of notional.
+        abs_notional = abs(notional)
+        p = max(0.0, min(1.0, fill_price))
+        fee = abs_notional * self._fee_rate * p * (1.0 - p)
+        return Fill(
+            side=side,
+            shares_delta=delta,
+            fill_price=fill_price,
+            notional=notional,
+            fee=fee,
+        )

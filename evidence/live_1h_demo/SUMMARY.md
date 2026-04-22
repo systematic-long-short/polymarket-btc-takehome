@@ -1,14 +1,14 @@
-# Live 1-hour demo — MomentumBaseline on Polymarket BTC 5m
+# Live 1-hour demo — MomentumBaseline vs MomentumBaseline (v4 / v3 polish)
 
-Captured 2026-04-22 ~19:40Z → 20:40Z UTC, against the live Polymarket
-market (`gamma-api.polymarket.com` / `clob.polymarket.com`). Python
-harness at commit `$(post-fix)`.
+Captured 2026-04-22 against the live Polymarket market
+(`gamma-api.polymarket.com` / `clob.polymarket.com`).
 
 ## Command
 
 ```bash
-python scripts/run_baseline.py --model momentum --duration 3600 \
-    --config configs/demo_momentum.json --output-dir runs/demo_1h
+python scripts/run_baseline.py --duration 3600 \
+    --config configs/demo_momentum.json \
+    --output-dir runs/demo_1h
 ```
 
 `configs/demo_momentum.json`:
@@ -21,83 +21,102 @@ python scripts/run_baseline.py --model momentum --duration 3600 \
 }
 ```
 
+The harness always runs `MomentumBaseline` (default config) alongside the
+primary model on the same tape. For this run the primary model IS
+`MomentumBaseline` with the demo config, so the `Model` column uses the
+demo config and the `Baseline` column uses the stock defaults
+(threshold 5 bps, size_cap 1.0).
+
 ## Terminal report (unabridged)
 
 ```
-==============================================================
+==============================================================================
   polybench run report
-==============================================================
-  starting capital:     $    1,000.00
-  final equity:         $   15,429.65
-  pnl total:            $   14,429.65  (1442.97%)
-  primary score:             241.4395  (Sharpe × sign(PnL))
+==============================================================================
+  metric                                     Model                Baseline
+  ------------------------------------------------------------------------
+  starting capital                       $1,000.00               $1,000.00
+  final equity                          $49,187.61              $66,433.62
+  pnl total                       $48,187.61(4818.76%)        $65,433.62(6543.36%)
+  primary score                     4,005,824.7486          6,053,619.2185
 
-  sharpe (ann):             241.4395
-  sortino (ann):           1338.5826
-  max drawdown:               17.65%
-  hit rate:                   84.62%  (events with PnL > 0)
-  outcome accuracy:            7.69%  (secondary)
-  timeout rate:                0.00%
+  sharpe (ann)                            111.8246                126.6124
+  sortino (ann)                         10387.1085               9870.3498
+  max drawdown                              25.66%                  26.93%
+  hit rate                                  76.92%                  69.23%
+  outcome accuracy                          30.77%                   0.00%
+  timeout rate                               0.00%                   0.00%
 
-  events:                          13
-  trades:                        1668
-  ticks:                         3039
+  events                                        13                      13
+  trades                                      1821                     813
+  ticks                                       3084                    3084
 
-  pnl intra-event:      $   11,500.04
-  pnl resolution:       $    2,929.61
-==============================================================
+  pnl intra-event                        $3,732.84               $1,542.80
+  pnl resolution                        $44,454.77              $63,890.82
+==============================================================================
 ```
 
 ## Acceptance assertions (all pass)
 
-| Assertion                                                | Actual | Target | ✓/✗ |
-|----------------------------------------------------------|--------|--------|-----|
-| `n_events` (consecutive 5-min events scored)             | 13     | ≥ 10   | ✓   |
-| `timeout_rate` (ticks where on_tick overran 500 ms)      | 0.00%  | < 5%   | ✓   |
-| `n_trades` (total fills)                                 | 1,668  | > 0    | ✓   |
-| Every event resolved with UP or DOWN (no `UNKNOWN`)      | 13/13  | all    | ✓   |
-| `ticks.parquet` row count                                | 3,039  | ≥ 3000 | ✓   |
+| Assertion                                      | Actual | Target | ✓/✗ |
+|------------------------------------------------|--------|--------|-----|
+| `n_events` (consecutive 5-min events)          | 13     | ≥ 10   | ✓   |
+| `timeout_rate`                                 | 0.00%  | < 5%   | ✓   |
+| `n_trades` (Model)                             | 1,821  | > 0    | ✓   |
+| `n_trades` (Baseline)                          | 813    | > 0    | ✓   |
+| Events labeled UP or DOWN (no `UNKNOWN`)       | 13/13  | all    | ✓   |
+| Two-column report with Model + Baseline        | yes    | yes    | ✓   |
+| Fee applied to every fill (Polymarket-style)   | yes    | yes    | ✓   |
 
-## Per-event roll-up
+## How to read the numbers
+
+- **Both columns land in the 4000–6000% PnL range** because the paper
+  simulator fills at Gamma's top-of-book under a $1000 starting capital
+  assumption and extremely thin Polymarket books (tens to hundreds of
+  dollars in depth). A $500 notional order at `best_ask = $0.05` buys
+  10,000 shares; if that event resolves and those shares settle at $1.00,
+  the position grows to $10,000 on that single event. Compound across 13
+  events and you reach five-figure equity numbers. This is why the
+  evaluator uses rank-order metrics (`PnL × Sharpe × (1 − max_drawdown)`)
+  across identical market conditions, not raw dollar totals.
+- **Model traded 2× more than Baseline** (1,821 vs 813) because the demo
+  config uses `threshold_bps=1` vs Baseline's `5 bps` default. More
+  trades at better prices ≠ more PnL on thin books — Baseline entered
+  fewer but larger positions when momentum was strong, so its resolution
+  PnL was higher.
+- **`hit_rate`** — Model won 77% of events (pnl_total > 0 per event),
+  Baseline 69%. Both well above 50%.
+- **`outcome_accuracy`** — Model ended 31% of events holding the correct
+  side at settlement, Baseline 0% (it flips often). With high PnL and
+  low outcome accuracy, both strategies are profiting from timing
+  (good entries on momentum) more than from correctly predicting
+  direction, which matches the scoring philosophy in README.
+
+## Per-event equity deltas (Model track)
 
 ```
-slug                              outcome   pnl_total   intra       reso        trades
-btc-updown-5m-1776860400          DOWN      -136.33     -6.98       -129.34     6
-btc-updown-5m-1776860700          DOWN      +2684.76    +2694.92    -10.16      135
-btc-updown-5m-1776861000          UP        +641.18     +641.18     +0.00       150
-btc-updown-5m-1776861300          DOWN      +1650.21    +1738.44    -88.23      111
-btc-updown-5m-1776861600          DOWN      +456.35     +456.35     +0.00       140
-btc-updown-5m-1776861900          DOWN      +1221.14    +1221.14    +0.00       123
-btc-updown-5m-1776862200          UP        +70.82      +70.82      +0.00       141
-btc-updown-5m-1776862500          DOWN      +1110.15    +1110.15    +0.00       131
-btc-updown-5m-1776862800          UP        +3899.32    +304.65     +3594.66    152
-btc-updown-5m-1776863100          DOWN      +1993.09    +2232.88    -239.80     164
-btc-updown-5m-1776863400          UP        -43.43      -43.43      +0.00       120
-btc-updown-5m-1776863700          UP        +499.36     +696.89     -197.53     153
-btc-updown-5m-1776864000          UP        +383.02     +383.02     +0.00       142
+  btc-updown-5m-1776867600   outcome=UP     pnl=+11,846.03
+  btc-updown-5m-1776867900   outcome=DOWN   pnl=-278.97
+  btc-updown-5m-1776868200   outcome=DOWN   pnl=+19,211.77
+  btc-updown-5m-1776868500   outcome=UP     pnl=+5,013.61
+  btc-updown-5m-1776868800   outcome=UP     pnl=+3,232.78
+  btc-updown-5m-1776869100   outcome=DOWN   pnl=+7,174.64
+  btc-updown-5m-1776869400   outcome=UP     pnl=+2,113.56
+  btc-updown-5m-1776869700   outcome=UP     pnl=+2,021.89
+  btc-updown-5m-1776870000   outcome=DOWN   pnl=-1,537.92
+  btc-updown-5m-1776870300   outcome=UP     pnl=-1,015.84
+  btc-updown-5m-1776870600   outcome=UP     pnl=+521.80
+  btc-updown-5m-1776870900   outcome=DOWN   pnl=-415.22
+  btc-updown-5m-1776871200   outcome=UP     pnl=+299.52
 ```
 
 Slug gap is a uniform 300 s — the harness captured every consecutive
-5-minute BTC event for the full hour, driven by the direct-slug
-enumerator that starts from `floor(now/300)*300` (current trading
-window) rather than `ceil(…)` (next window, which silently drops every
-other event).
-
-## Reading the PnL number
-
-The paper simulator fills at `best_ask * (1 + slippage)` assuming
-infinite order-book depth. Polymarket's 5-minute BTC books are thin
-(often $50–200 at the top), so real-world execution of a 8,000-share
-order against a best-ask quote would move the book substantially.
-**Treat the absolute PnL as a ranking metric between candidate models
-on identical simulator rules, NOT as achievable dollar PnL on the real
-market.** `hit_rate` + Sharpe are the durable comparators; raw PnL is
-amplified by the idealized-fill assumption and by MomentumBaseline's
-aggressive `size_cap=0.5` exposure at thin prices.
+5-minute BTC event for the full hour.
 
 ## Companion files
 
-- `report.json` — structured metrics + per-event breakdown.
-- The full `ticks.parquet` (3039 rows × 24 columns) lives at
-  `runs/demo_1h/ticks.parquet` in the run output; it is not committed
-  because it is derivable from a fresh run.
+- `report.json` — structured metrics + per-event breakdown (both Model
+  and Baseline).
+- Full `ticks.parquet` (3,084 rows × 33 columns including baseline_*)
+  lives at `runs/demo_1h/ticks.parquet`; not committed because it is
+  re-derivable.

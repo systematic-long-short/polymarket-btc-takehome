@@ -120,11 +120,15 @@ def test_summarize_keys_and_types() -> None:
     assert 0.0 <= m["max_drawdown"] <= 1.0
     assert m["n_events"] == 1
     assert m["hit_rate"] == 1.0
-    # Primary score: |Sharpe| × sign(PnL). pnl>0 → score == abs(sharpe).
-    assert m["primary_score"] == pytest.approx(abs(m["sharpe"]))
+    # Primary score: PnL × Sharpe × (1 − max_drawdown).
+    expected = m["pnl_total"] * m["sharpe"] * max(0.0, 1.0 - m["max_drawdown"])
+    assert m["primary_score"] == pytest.approx(expected)
 
 
-def test_primary_score_sign_inverts_on_loss() -> None:
+def test_primary_score_formula_is_pnl_times_sharpe_times_one_minus_mdd() -> None:
+    """Primary score = PnL × Sharpe × (1 − max_drawdown). With negative PnL
+    and (usually) negative Sharpe the product can be positive — but in the
+    ranking it's penalized by low magnitude and by the drawdown factor."""
     equity = [1000.0, 1005.0, 990.0, 980.0]
     events = [_event(-20.0, pnl_resolution=-15.0, outcome="DOWN")]
     m = summarize(
@@ -133,5 +137,25 @@ def test_primary_score_sign_inverts_on_loss() -> None:
         equity_curve=equity,
         events=events,
     )
-    # Loss → primary_score is -|sharpe|
-    assert m["primary_score"] == pytest.approx(-abs(m["sharpe"]))
+    expected = m["pnl_total"] * m["sharpe"] * max(0.0, 1.0 - m["max_drawdown"])
+    assert m["primary_score"] == pytest.approx(expected)
+
+
+def test_primary_score_penalises_drawdown() -> None:
+    """Identical PnL and Sharpe, heavier drawdown → lower primary_score."""
+    clean = summarize(
+        starting_capital=1000.0,
+        final_equity=1100.0,
+        equity_curve=[1000, 1020, 1050, 1080, 1100],
+        events=[_event(100.0)],
+    )
+    drawdown = summarize(
+        starting_capital=1000.0,
+        final_equity=1100.0,
+        equity_curve=[1000, 1200, 800, 1100, 1100],   # 33% peak-to-trough
+        events=[_event(100.0)],
+    )
+    assert drawdown["max_drawdown"] > clean["max_drawdown"]
+    # Drawdown penalty should produce a smaller primary_score for the volatile
+    # track, even though PnL is identical.
+    assert drawdown["primary_score"] < clean["primary_score"]

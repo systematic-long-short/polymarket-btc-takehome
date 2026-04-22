@@ -54,6 +54,7 @@ class HarnessConfig:
     clob_poll_interval_s: float = DEFAULT_CLOB_POLL_INTERVAL_S
     starting_capital: float = 1000.0
     slippage_bps: float = 200.0
+    fee_rate: float = 0.072   # Polymarket-style per-trade fee coefficient
     price_source: str = "binance"
     price_window_size: int = 300
     output_dir: Path = Path("runs/latest")
@@ -67,8 +68,17 @@ class Harness:
         config: HarnessConfig,
         client: PolymarketClient | None = None,
         pricefeed: PriceFeed | None = None,
+        baseline_model: Model | None = None,
     ) -> None:
         self._model = model
+        # Always pair the candidate with a MomentumBaseline on the same tape so
+        # candidates immediately see how they performed against the bar. When
+        # the caller passes the MomentumBaseline as `model`, both tracks end up
+        # identical — still useful as a sanity readout for the reference model.
+        if baseline_model is None:
+            from polybench.baselines import MomentumBaseline
+            baseline_model = MomentumBaseline()
+        self._baseline_model = baseline_model
         self._cfg = config
         self._client = client or PolymarketClient()
         self._own_client = client is None
@@ -79,6 +89,12 @@ class Harness:
         self._simulator = PaperSimulator(
             starting_capital=config.starting_capital,
             slippage_bps=config.slippage_bps,
+            fee_rate=config.fee_rate,
+        )
+        self._baseline_simulator = PaperSimulator(
+            starting_capital=config.starting_capital,
+            slippage_bps=config.slippage_bps,
+            fee_rate=config.fee_rate,
         )
         self._output_dir = Path(config.output_dir)
         self._output_dir.mkdir(parents=True, exist_ok=True)
@@ -92,6 +108,7 @@ class Harness:
         self._up_mid_window: list[float] = []
         self._btc_1hz_window: list[float] = []   # one sample per tick — what models see
         self._equity_curve: list[float] = []
+        self._baseline_equity_curve: list[float] = []
         self._stop = asyncio.Event()
         self._clob_task: asyncio.Task | None = None
         self._executor = ThreadPoolExecutor(
@@ -270,11 +287,18 @@ class Harness:
         self._simulator.start_event(
             event_id=event.event_id, slug=event.slug, ts=now, up_mid=up_mid, down_mid=down_mid
         )
+        self._baseline_simulator.start_event(
+            event_id=event.event_id, slug=event.slug, ts=now, up_mid=up_mid, down_mid=down_mid
+        )
         market_info = event.to_market_info(self._scratch_dir)
         try:
             self._model.on_start(market_info)
         except Exception:  # noqa: BLE001
             log.exception("model.on_start raised")
+        try:
+            self._baseline_model.on_start(market_info)
+        except Exception:  # noqa: BLE001
+            log.exception("baseline_model.on_start raised")
 
     async def _resolve_and_rollover(self, now: float) -> None:
         event = self._current_event
@@ -307,57 +331,70 @@ class Harness:
         ``endDate``. The live ``_poll_resolution`` budget is short (so event
         rollover stays tight), so this post-mortem is where lagging events
         get upgraded. Retries every ``poll_interval_s`` until all events
-        resolve or ``max_wait_s`` elapses.
+        resolve or ``max_wait_s`` elapses. Updates BOTH the model and the
+        baseline event ledgers — they share the same slug stream so a
+        single Gamma refresh resolves both tracks.
         """
         import dataclasses as _dc
-        events = self._simulator._completed_events
-        if not events:
+
+        model_events = self._simulator._completed_events
+        baseline_events = self._baseline_simulator._completed_events
+        if not model_events and not baseline_events:
             return
+
+        def _label_from(refreshed) -> str | None:
+            up, down = refreshed.outcome_prices
+            if up > (1.0 - RESOLVED_EPSILON) and down < RESOLVED_EPSILON:
+                return "UP"
+            if down > (1.0 - RESOLVED_EPSILON) and up < RESOLVED_EPSILON:
+                return "DOWN"
+            if refreshed.closed:
+                return "UP" if up >= down else "DOWN"
+            return None
+
         deadline = time.time() + max_wait_s
         total_upgraded = 0
         iteration = 0
         while time.time() < deadline:
             iteration += 1
-            unknown_indices = [
-                i for i, e in enumerate(events) if e.resolved_outcome == "UNKNOWN"
-            ]
-            if not unknown_indices:
+            # Collect all unique UNKNOWN slugs across both ledgers.
+            unknown_slugs = {
+                e.slug for e in model_events if e.resolved_outcome == "UNKNOWN"
+            } | {
+                e.slug for e in baseline_events if e.resolved_outcome == "UNKNOWN"
+            }
+            if not unknown_slugs:
                 break
-            log.info(
-                "postmortem iter %d: %d UNKNOWN events remaining",
-                iteration,
-                len(unknown_indices),
-            )
+            log.info("postmortem iter %d: %d UNKNOWN slugs remaining", iteration, len(unknown_slugs))
             iter_upgraded = 0
-            for idx in unknown_indices:
-                ev = events[idx]
+            for slug in unknown_slugs:
                 try:
-                    refreshed = await self._client.refresh_event(ev.slug)
+                    refreshed = await self._client.refresh_event(slug)
                 except Exception as exc:  # noqa: BLE001
-                    log.debug("postmortem refresh failed for %s: %s", ev.slug, exc)
+                    log.debug("postmortem refresh failed for %s: %s", slug, exc)
                     continue
                 if refreshed is None:
                     continue
-                up, down = refreshed.outcome_prices
-                if up > (1.0 - RESOLVED_EPSILON) and down < RESOLVED_EPSILON:
-                    label = "UP"
-                elif down > (1.0 - RESOLVED_EPSILON) and up < RESOLVED_EPSILON:
-                    label = "DOWN"
-                elif refreshed.closed:
-                    label = "UP" if up >= down else "DOWN"
-                else:
+                label = _label_from(refreshed)
+                if label is None:
                     continue
-                events[idx] = _dc.replace(ev, resolved_outcome=label)
-                iter_upgraded += 1
-                total_upgraded += 1
+                for ledger in (model_events, baseline_events):
+                    for i, ev in enumerate(ledger):
+                        if ev.slug == slug and ev.resolved_outcome == "UNKNOWN":
+                            ledger[i] = _dc.replace(ev, resolved_outcome=label)
+                            iter_upgraded += 1
+                            total_upgraded += 1
             if iter_upgraded == 0:
-                # None upgraded this round — wait before retry.
-                remaining = [i for i, e in enumerate(events) if e.resolved_outcome == "UNKNOWN"]
+                remaining = {
+                    e.slug for e in model_events if e.resolved_outcome == "UNKNOWN"
+                } | {
+                    e.slug for e in baseline_events if e.resolved_outcome == "UNKNOWN"
+                }
                 if not remaining:
                     break
                 await asyncio.sleep(poll_interval_s)
         if total_upgraded:
-            log.info("postmortem: upgraded %d UNKNOWN events to resolved", total_upgraded)
+            log.info("postmortem: upgraded %d UNKNOWN event rows", total_upgraded)
 
     async def _poll_resolution(
         self, event: EventDescriptor
@@ -405,7 +442,9 @@ class Harness:
         up_price = outcome[0] if (resolved and outcome is not None) else None
         down_price = outcome[1] if (resolved and outcome is not None) else None
         event_result = self._simulator.finish_event(now, up_price, down_price)
-        # Write a settlement row.
+        baseline_result = self._baseline_simulator.finish_event(now, up_price, down_price)
+        # Write a settlement row — both model and baseline tracks land at the
+        # same event boundary, so one row carries both snapshots.
         row = TickRow(
             ts=now,
             event_id=event.event_id,
@@ -429,6 +468,15 @@ class Harness:
             equity=self._simulator.position.cash,
             fills_this_tick=0,
             timeout=False,
+            baseline_signal_side="NONE",
+            baseline_signal_size=0.0,
+            baseline_signal_confidence=0.0,
+            baseline_position_up=self._baseline_simulator.position.up_shares,
+            baseline_position_down=self._baseline_simulator.position.down_shares,
+            baseline_cash=self._baseline_simulator.position.cash,
+            baseline_equity=self._baseline_simulator.position.cash,
+            baseline_fills_this_tick=0,
+            baseline_timeout=False,
             resolution_up=up_price if up_price is not None else float("nan"),
             resolution_down=down_price if down_price is not None else float("nan"),
             resolved_outcome=event_result.resolved_outcome,
@@ -439,11 +487,12 @@ class Harness:
         self._cached_down_book = None
         self._up_mid_window.clear()
         log.info(
-            "event %s closed: pnl=%.4f (intra=%.4f, reso=%.4f, outcome=%s)",
+            "event %s closed: model=%.4f (intra=%.4f, reso=%.4f) baseline=%.4f outcome=%s",
             event.slug,
             event_result.pnl_total,
             event_result.pnl_intra_event,
             event_result.pnl_resolution,
+            baseline_result.pnl_total,
             event_result.resolved_outcome,
         )
 
@@ -484,9 +533,15 @@ class Harness:
             event_id=self._current_event.event_id,
         )
 
-        signal, timed_out = await self._call_model_with_budget(tick)
+        # Run BOTH models against the same tick in parallel (same deadline).
+        (signal, timed_out), (baseline_signal, baseline_timed_out) = await asyncio.gather(
+            self._call_model_with_budget(self._model, tick),
+            self._call_model_with_budget(self._baseline_model, tick),
+        )
         if timed_out:
             self._simulator.record_timeout()
+        if baseline_timed_out:
+            self._baseline_simulator.record_timeout()
 
         up_top = BookTop(best_bid=up_book.best_bid, best_ask=up_book.best_ask, mid=up_book.mid)
         down_top = BookTop(
@@ -495,8 +550,12 @@ class Harness:
         fills = self._simulator.apply_signal(signal, up_top, down_top)
         equity = self._simulator.mark_to_market(up_top, down_top, now)
         self._equity_curve.append(equity)
+        baseline_fills = self._baseline_simulator.apply_signal(baseline_signal, up_top, down_top)
+        baseline_equity = self._baseline_simulator.mark_to_market(up_top, down_top, now)
+        self._baseline_equity_curve.append(baseline_equity)
 
         effective = signal or FLAT
+        baseline_effective = baseline_signal or FLAT
         row = TickRow(
             ts=now,
             event_id=self._current_event.event_id,
@@ -520,14 +579,25 @@ class Harness:
             equity=equity,
             fills_this_tick=len(fills),
             timeout=timed_out,
+            baseline_signal_side=baseline_effective.side.value if baseline_effective.side else "NONE",
+            baseline_signal_size=baseline_effective.size,
+            baseline_signal_confidence=baseline_effective.confidence,
+            baseline_position_up=self._baseline_simulator.position.up_shares,
+            baseline_position_down=self._baseline_simulator.position.down_shares,
+            baseline_cash=self._baseline_simulator.position.cash,
+            baseline_equity=baseline_equity,
+            baseline_fills_this_tick=len(baseline_fills),
+            baseline_timeout=baseline_timed_out,
         )
         self._recorder.record(row)
 
     async def _call_model_with_budget(
-        self, tick: Tick
+        self, model: Model, tick: Tick
     ) -> tuple[Signal | None, bool]:
         loop = asyncio.get_running_loop()
-        future = loop.run_in_executor(self._executor, self._safe_model_on_tick, tick)
+        future = loop.run_in_executor(
+            self._executor, self._safe_on_tick, model, tick
+        )
         try:
             signal = await asyncio.wait_for(future, timeout=self._cfg.model_budget_s)
             return (signal, False)
@@ -535,9 +605,9 @@ class Harness:
             log.debug("model.on_tick exceeded %.3fs budget", self._cfg.model_budget_s)
             return (None, True)
 
-    def _safe_model_on_tick(self, tick: Tick) -> Signal | None:
+    def _safe_on_tick(self, model: Model, tick: Tick) -> Signal | None:
         try:
-            result = self._model.on_tick(tick)
+            result = model.on_tick(tick)
         except Exception:  # noqa: BLE001
             log.exception("model.on_tick raised")
             return None
@@ -555,24 +625,31 @@ class Harness:
     # ---- run result ----
 
     def _build_run_result(self, started_ts: float, ended_ts: float) -> RunResult:
+        def _final_equity(sim: PaperSimulator, curve: list[float]) -> float:
+            canonical = sim.position.cash
+            if abs(canonical) > 1e-9:
+                return canonical
+            return curve[-1] if curve else sim.starting_capital
+
         events = self._simulator.completed_events
+        baseline_events = self._baseline_simulator.completed_events
         starting = self._simulator.starting_capital
-        final_equity = (
-            self._equity_curve[-1]
-            if self._equity_curve
-            else starting
+        final_equity = _final_equity(self._simulator, self._equity_curve)
+        baseline_final_equity = _final_equity(
+            self._baseline_simulator, self._baseline_equity_curve
         )
-        # After any per-event settlement, position is usually flattened, so
-        # take the last simulator cash as the canonical final equity.
-        canonical_final = self._simulator.position.cash
-        if abs(canonical_final) > 1e-9:
-            final_equity = canonical_final
 
         metrics = summarize(
             starting_capital=starting,
             final_equity=final_equity,
             equity_curve=[starting, *self._equity_curve],
             events=events,
+        )
+        baseline_metrics = summarize(
+            starting_capital=starting,
+            final_equity=baseline_final_equity,
+            equity_curve=[starting, *self._baseline_equity_curve],
+            events=baseline_events,
         )
         return RunResult(
             started_ts=started_ts,
@@ -583,6 +660,13 @@ class Harness:
             pnl_pct=(final_equity - starting) / starting if starting else 0.0,
             events=events,
             metrics=metrics,
+            baseline_events=baseline_events,
+            baseline_metrics=baseline_metrics,
+            baseline_final_equity=baseline_final_equity,
+            baseline_pnl_total=baseline_final_equity - starting,
+            baseline_pnl_pct=(
+                (baseline_final_equity - starting) / starting if starting else 0.0
+            ),
         )
 
     def _write_report(self, result: RunResult) -> None:
@@ -591,14 +675,26 @@ class Harness:
             "started_ts": result.started_ts,
             "ended_ts": result.ended_ts,
             "starting_capital": result.starting_capital,
-            "final_equity": result.final_equity,
-            "pnl_total": result.pnl_total,
-            "pnl_pct": result.pnl_pct,
-            "metrics": result.metrics,
-            "events": [
-                dataclasses.asdict(e) if dataclasses.is_dataclass(e) else dict(e)
-                for e in result.events
-            ],
+            "model": {
+                "final_equity": result.final_equity,
+                "pnl_total": result.pnl_total,
+                "pnl_pct": result.pnl_pct,
+                "metrics": result.metrics,
+                "events": [
+                    dataclasses.asdict(e) if dataclasses.is_dataclass(e) else dict(e)
+                    for e in result.events
+                ],
+            },
+            "baseline": {
+                "final_equity": result.baseline_final_equity,
+                "pnl_total": result.baseline_pnl_total,
+                "pnl_pct": result.baseline_pnl_pct,
+                "metrics": result.baseline_metrics,
+                "events": [
+                    dataclasses.asdict(e) if dataclasses.is_dataclass(e) else dict(e)
+                    for e in result.baseline_events
+                ],
+            },
         }
         report_path.write_text(json.dumps(payload, indent=2, default=_json_default))
         log.info("wrote %s", report_path)
@@ -614,30 +710,52 @@ def _json_default(obj: Any) -> Any:
 
 def format_summary(result: RunResult) -> str:
     m = result.metrics
+    b = result.baseline_metrics
+    bar = "=" * 78
+    hdr = f"  {'metric':<24}{'Model':>24}{'Baseline':>24}"
+    pnl_pct_m = f"({result.pnl_pct:.2%})"
+    pnl_pct_b = f"({result.baseline_pnl_pct:.2%})"
+
+    def fmt_dollar(label: str, model_val: float, base_val: float) -> str:
+        return f"  {label:<24}{'$' + format(model_val, ',.2f'):>24}{'$' + format(base_val, ',.2f'):>24}"
+
+    def fmt_num(label: str, model_val: float, base_val: float, width: str = ".4f") -> str:
+        return f"  {label:<24}{format(model_val, width):>24}{format(base_val, width):>24}"
+
+    def fmt_pct(label: str, model_val: float, base_val: float) -> str:
+        return f"  {label:<24}{format(model_val, '.2%'):>24}{format(base_val, '.2%'):>24}"
+
+    def fmt_int(label: str, model_val: int, base_val: int) -> str:
+        return f"  {label:<24}{model_val:>24d}{base_val:>24d}"
+
     lines = [
         "",
-        "=" * 62,
+        bar,
         "  polybench run report",
-        "=" * 62,
-        f"  starting capital:     ${result.starting_capital:>12,.2f}",
-        f"  final equity:         ${result.final_equity:>12,.2f}",
-        f"  pnl total:            ${result.pnl_total:>12,.2f}  ({result.pnl_pct:.2%})",
-        f"  primary score:         {m.get('primary_score', 0.0):>12.4f}  (Sharpe × sign(PnL))",
+        bar,
+        hdr,
+        "  " + "-" * 72,
+        fmt_dollar("starting capital", result.starting_capital, result.starting_capital),
+        fmt_dollar("final equity", result.final_equity, result.baseline_final_equity),
+        f"  {'pnl total':<24}{'$' + format(result.pnl_total, ',.2f'):>18}{pnl_pct_m:>6}"
+        f"{'$' + format(result.baseline_pnl_total, ',.2f'):>18}{pnl_pct_b:>6}",
+        fmt_num("primary score", m.get("primary_score", 0.0), b.get("primary_score", 0.0),
+                width=",.4f"),
         "",
-        f"  sharpe (ann):         {m.get('sharpe', 0.0):>12.4f}",
-        f"  sortino (ann):        {m.get('sortino', 0.0):>12.4f}",
-        f"  max drawdown:         {m.get('max_drawdown', 0.0):>12.2%}",
-        f"  hit rate:             {m.get('hit_rate', 0.0):>12.2%}  (events with PnL > 0)",
-        f"  outcome accuracy:     {m.get('outcome_accuracy', 0.0):>12.2%}  (secondary)",
-        f"  timeout rate:         {m.get('timeout_rate', 0.0):>12.2%}",
+        fmt_num("sharpe (ann)", m.get("sharpe", 0.0), b.get("sharpe", 0.0)),
+        fmt_num("sortino (ann)", m.get("sortino", 0.0), b.get("sortino", 0.0)),
+        fmt_pct("max drawdown", m.get("max_drawdown", 0.0), b.get("max_drawdown", 0.0)),
+        fmt_pct("hit rate", m.get("hit_rate", 0.0), b.get("hit_rate", 0.0)),
+        fmt_pct("outcome accuracy", m.get("outcome_accuracy", 0.0), b.get("outcome_accuracy", 0.0)),
+        fmt_pct("timeout rate", m.get("timeout_rate", 0.0), b.get("timeout_rate", 0.0)),
         "",
-        f"  events:                {m.get('n_events', 0):>12d}",
-        f"  trades:                {m.get('n_trades', 0):>12d}",
-        f"  ticks:                 {m.get('n_ticks', 0):>12d}",
+        fmt_int("events", int(m.get("n_events", 0)), int(b.get("n_events", 0))),
+        fmt_int("trades", int(m.get("n_trades", 0)), int(b.get("n_trades", 0))),
+        fmt_int("ticks", int(m.get("n_ticks", 0)), int(b.get("n_ticks", 0))),
         "",
-        f"  pnl intra-event:      ${m.get('pnl_intra_event', 0.0):>12,.2f}",
-        f"  pnl resolution:       ${m.get('pnl_resolution', 0.0):>12,.2f}",
-        "=" * 62,
+        fmt_dollar("pnl intra-event", m.get("pnl_intra_event", 0.0), b.get("pnl_intra_event", 0.0)),
+        fmt_dollar("pnl resolution", m.get("pnl_resolution", 0.0), b.get("pnl_resolution", 0.0)),
+        bar,
         "",
     ]
     return "\n".join(lines)

@@ -11,9 +11,9 @@ Internal. Not distributed to candidates; candidates see `README.md`.
 ## The scoring pass
 
 Run the candidate for a continuous **2-hour live window** (`--duration 7200`).
-Over that window, the harness will chain ~24 consecutive 5-min events when
-live events are available. Run the three baselines in **the same window**
-so ambient price conditions are identical.
+The harness chains ~24 consecutive 5-min BTC events back-to-back and always
+runs `MomentumBaseline` in parallel on the same tape, so a single run
+produces the apples-to-apples Model-vs-Baseline comparison.
 
 ```bash
 # Set up a fresh working dir per candidate.
@@ -22,65 +22,64 @@ mkdir -p runs/<candidate_id>
 # 1. Scan. Must return "accept" (exit 0). If not — reject.
 python scripts/scan_submission.py --file <submission>/model_submission.py
 
-# 2. Run candidate live.
+# 2. Run candidate live. Baseline runs alongside automatically.
 python scripts/run_candidate.py \
     --submission <submission>/model_submission.py \
     --config <submission>/config.json \         # optional
     --duration 7200 \
-    --output runs/<candidate_id>/candidate
-
-# 3. Run each baseline in a parallel window (separate processes).
-python scripts/run_baseline.py --model momentum --duration 7200 \
-    --output-dir runs/<candidate_id>/baseline_momentum
-python scripts/run_baseline.py --model alwaysup --duration 7200 \
-    --output-dir runs/<candidate_id>/baseline_alwaysup
-python scripts/run_baseline.py --model random --duration 7200 \
-    --output-dir runs/<candidate_id>/baseline_random
+    --output runs/<candidate_id>/
 ```
 
-## Metrics to read from `report.json`
+## Metrics in `report.json`
 
-Primary:
-- `pnl_total` — dollars.
-- `pnl_pct` — vs. `starting_capital`.
-- `primary_score` — `|Sharpe| × sign(PnL)`. This is the headline.
+`report.json` has two top-level blocks, `model` and `baseline`, each with
+the same schema. The scoring comparison is always between the two.
 
-Risk:
-- `sharpe` — annualized on tick-level returns.
-- `sortino` — downside-only.
-- `max_drawdown` — peak-to-trough.
+**Primary score (the headline):**
 
-Consistency:
-- `n_events` — typically ~24 over a 2h run.
+    primary_score = pnl_total × sharpe × (1 − max_drawdown)
+
+A winning model with high Sharpe and small drawdown produces a large
+positive score. A losing model with consistently-negative Sharpe produces
+a positive-but-small product (two negatives cancel) — disambiguate with
+Sharpe alone and PnL sign, which we always show alongside.
+
+**Secondary (risk + consistency):**
+
+- `sharpe` / `sortino` — annualized.
+- `max_drawdown` — peak-to-trough fraction.
 - `hit_rate` — fraction of events closed positive.
-- PnL stdev across events (compute from the `events[]` list).
+- `timeout_rate` — fraction of ticks where `on_tick` overran.
+- `n_events`, `n_trades`, `n_ticks` — throughput metadata.
 
-Analytical:
+**Analytical (PnL attribution):**
+
 - `pnl_intra_event` vs `pnl_resolution` — a model whose PnL comes
-  overwhelmingly from resolution is essentially just directionally
-  betting. A model with high intra-event PnL is actually trading.
-- `outcome_accuracy` — a proxy for directional correctness. Low outcome
-  accuracy with high PnL means the candidate profits by timing, not by
-  predicting.
-- `timeout_rate` — if >5% the model is too slow.
+  overwhelmingly from resolution is just directionally betting. A model
+  with high intra-event PnL is actually trading.
+- `outcome_accuracy` — proxy for directional correctness. Low outcome
+  accuracy with high PnL means the candidate profits by timing.
 
 ## The bar
 
-A submission **passes** if, on the same 2-hour window:
-- `primary_score(candidate) > primary_score(momentum)` **by a meaningful
-  margin** — not within noise. Check Sharpe magnitude + PnL sign align.
-- `max_drawdown(candidate) ≤ max_drawdown(momentum) + 0.05` — we're fine
-  with more drawdown if the returns justify it, not if it's just
-  leverage dressed up as alpha.
-- `timeout_rate < 5%`.
-- The writeup articulates a real hypothesis — not "I tried some ML and
+A submission **passes** if, on the same 2-hour window (both values read
+from the candidate's `report.json`):
+
+- `model.primary_score > baseline.primary_score` **by a meaningful
+  margin** — not within noise.
+- `model.max_drawdown ≤ baseline.max_drawdown + 0.05` — we allow a bit
+  more risk if the return justifies it, not much more.
+- `model.timeout_rate < 5%`.
+- The writeup articulates a real hypothesis, not "I tried some ML and
   it learned something."
 
 A submission **fails fast** if:
-- The scanner rejects the file.
-- The harness can't load the `ModelSubmission` class.
-- The run errors out repeatedly (`on_tick` raising).
-- `primary_score(candidate) ≤ primary_score(random)`.
+
+- Scanner rejects the file.
+- Harness can't load `ModelSubmission`.
+- `on_tick` raises consistently.
+- `model.primary_score ≤ 0` after a full run (net loser).
+- `model.primary_score ≤ baseline.primary_score` (no edge).
 - No writeup submitted.
 
 ## Things to look for in the writeup
@@ -88,54 +87,55 @@ A submission **fails fast** if:
 - Do they explain WHY their signal should work? "Order book imbalance
   predicts Polymarket mid-drift" is a testable hypothesis. "A neural net
   learned the pattern" is not.
-- Do they acknowledge the spread + slippage? The default 2% is
-  punishing; a strategy that trades frequently needs signal strong
-  enough to overcome that.
-- Do they describe the failure mode? If the BTC market goes flat, what
-  does their signal do? How did they validate this?
-- Is the code readable? We read every line of every submission.
+- Do they acknowledge spread + slippage + fees? The default 2% slippage
+  plus up-to-1.8% fee at p=0.5 adds up; a frequently-trading strategy
+  needs signal strong enough to overcome it.
+- Do they describe the failure mode? If BTC goes flat, what does their
+  signal do? How did they validate this?
+- Is the code readable? We read every line.
 
 ## Per-event inspection
 
-The harness writes `ticks.parquet` alongside `report.json`. Open it:
+The harness writes `ticks.parquet` alongside `report.json` with both
+model and `baseline_*` columns. Open it:
 
 ```python
 import pandas as pd
-df = pd.read_parquet("runs/<candidate_id>/candidate/ticks.parquet")
-# Per-event PnL curve:
+df = pd.read_parquet("runs/<candidate_id>/ticks.parquet")
+# Per-event equity trace for each track:
 for eid, g in df.groupby("event_id"):
     g = g.sort_values("ts")
-    print(eid, "pnl delta:", g["equity"].iloc[-1] - g["equity"].iloc[0])
+    model_delta = g["equity"].iloc[-1] - g["equity"].iloc[0]
+    base_delta = g["baseline_equity"].iloc[-1] - g["baseline_equity"].iloc[0]
+    print(eid, f"model:{model_delta:+.2f} base:{base_delta:+.2f}")
 ```
 
 Red flags while skimming:
 - Same signal every tick for hundreds of ticks → they're not reacting to
   the market.
-- Signal side flips every tick → they're overtrading and paying spread.
-- `fills_this_tick` consistently == 0 even when signals change → the
-  book is one-sided or their target quantities are sub-tick noise.
+- Signal flips every tick → overtrading, paying spread on every reversal.
+- `fills_this_tick` consistently == 0 even when signals change → book is
+  one-sided (see `BookTop.is_tradable`) or the target quantity delta is
+  sub-tick noise.
 
 ## When events aren't live
 
 Polymarket's 5-min BTC series runs in bursts. If no live events are
-available during the 2h window:
+available during the scoring window:
 
-1. The candidate's scoring run will log `no active BTC 5m event —
-   waiting...` repeatedly. Their PnL may be $0 (no ticks processed).
-2. Postpone the scoring run until the series resumes; do not substitute
-   replay against the committed fixture for official scoring.
-3. For development feedback on candidates already submitted, use replay
-   against the committed fixture — it's deterministic but does not
-   reflect live market microstructure.
+1. The candidate's run will log `no active BTC 5m event — waiting...`
+   repeatedly. PnL may be $0.
+2. Postpone the scoring run until the series resumes. Do not substitute
+   the replay fixture for official scoring.
 
 ## Anti-exploitation checks
 
-The AST scanner is a screen, not a sandbox. For the scoring run we
-also:
+The AST scanner is a screen, not a sandbox. For scoring we also:
 
 - Cap process memory via `ulimit -v 4194304` (~4 GB).
-- Run in a dedicated working directory (`runs/<candidate_id>/candidate/`);
-  the harness only passes `market_info.scratch_dir` to the model.
-- After the run, grep the model file for any novel imports we missed.
-- Review `report.json` — `n_trades == 0` with nonzero PnL is a red flag
-  (possible fake PnL by side effects on simulator state).
+- Run in a dedicated working directory; `MarketInfo.scratch_dir` is the
+  only filesystem path the model is told about.
+- After the run, grep the submitted file for any imports the scanner
+  might have missed.
+- Review `report.json` — `n_trades == 0` with nonzero `pnl_total` is a
+  red flag (possible simulator-state shenanigans).

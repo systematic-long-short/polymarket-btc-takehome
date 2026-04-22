@@ -98,7 +98,13 @@ class EventResult:
 
 @dataclass(frozen=True, slots=True)
 class RunResult:
-    """Delivered to ``on_finish`` when the harness stops."""
+    """Delivered to ``on_finish`` when the harness stops.
+
+    ``metrics`` carries the primary model's summary. ``baseline_metrics`` and
+    ``baseline_events`` mirror the same harness run against the reference
+    MomentumBaseline on the same tape, so the report can show a two-column
+    Model-vs-Baseline comparison without re-running the market.
+    """
 
     started_ts: float
     ended_ts: float
@@ -108,6 +114,11 @@ class RunResult:
     pnl_pct: float
     events: Sequence[EventResult] = field(default_factory=tuple)
     metrics: dict[str, Any] = field(default_factory=dict)
+    baseline_events: Sequence[EventResult] = field(default_factory=tuple)
+    baseline_metrics: dict[str, Any] = field(default_factory=dict)
+    baseline_final_equity: float = 0.0
+    baseline_pnl_total: float = 0.0
+    baseline_pnl_pct: float = 0.0
 
 
 class Model(ABC):

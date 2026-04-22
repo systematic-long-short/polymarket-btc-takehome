@@ -121,7 +121,14 @@ def _parse_book(token_id: str, payload: dict[str, Any], ts: float) -> Book:
 
 @dataclass
 class EventDescriptor:
-    """Raw event data returned by Gamma, before harness-specific wrapping."""
+    """Raw event data returned by Gamma, plus its per-tick refreshable quotes.
+
+    ``best_bid``/``best_ask``/``last_trade`` on the descriptor come from
+    ``markets[0]`` on the Gamma event payload and reflect the UP token.
+    DOWN-token quotes are derived by arbitrage (1 - UP). These fields act as
+    a durable top-of-book source when the CLOB ``/book`` endpoint 404s on a
+    given token id.
+    """
 
     event_id: str
     slug: str
@@ -131,6 +138,11 @@ class EventDescriptor:
     down_token_id: str
     up_outcome_label: str   # "Up" / "Yes"
     down_outcome_label: str # "Down" / "No"
+    closed: bool = False
+    best_bid: float = 0.0                            # UP token best bid (from Gamma)
+    best_ask: float = 0.0                            # UP token best ask
+    last_trade: float = 0.0
+    outcome_prices: tuple[float, float] = (0.0, 0.0) # (up_mid, down_mid) from outcomePrices
     raw: dict[str, Any] = field(default_factory=dict)
 
     def to_market_info(self, scratch_dir: Path) -> MarketInfo:
@@ -142,6 +154,46 @@ class EventDescriptor:
             up_token_id=self.up_token_id,
             down_token_id=self.down_token_id,
             scratch_dir=scratch_dir,
+        )
+
+    def synth_up_book(self) -> "Book":
+        """Construct a minimal Book from Gamma's UP-side summary quotes."""
+        import time as _time
+        up_mid = self.outcome_prices[0] if self.outcome_prices[0] > 0 else self.last_trade
+        bid = self.best_bid if self.best_bid > 0 else max(0.0, up_mid - 0.01)
+        ask = self.best_ask if self.best_ask > 0 else min(1.0, up_mid + 0.01)
+        last = self.last_trade if self.last_trade > 0 else (bid + ask) / 2.0 if (bid + ask) > 0 else 0.5
+        bids = (Level(price=bid, size=0.0),) if bid > 0 else ()
+        asks = (Level(price=ask, size=0.0),) if ask > 0 else ()
+        return Book(
+            token_id=self.up_token_id,
+            bids=bids,
+            asks=asks,
+            best_bid=bid,
+            best_ask=ask,
+            last_trade=last,
+            ts=_time.time(),
+        )
+
+    def synth_down_book(self) -> "Book":
+        """Construct a DOWN-token Book by inverting UP via ``1 − p`` arbitrage."""
+        import time as _time
+        up = self.synth_up_book()
+        down_bid = max(0.0, 1.0 - up.best_ask) if up.best_ask > 0 else 0.0
+        down_ask = min(1.0, 1.0 - up.best_bid) if up.best_bid > 0 else 0.0
+        down_last = self.outcome_prices[1] if self.outcome_prices[1] > 0 else (
+            (down_bid + down_ask) / 2.0 if (down_bid + down_ask) > 0 else 0.5
+        )
+        bids = (Level(price=down_bid, size=0.0),) if down_bid > 0 else ()
+        asks = (Level(price=down_ask, size=0.0),) if down_ask > 0 else ()
+        return Book(
+            token_id=self.down_token_id,
+            bids=bids,
+            asks=asks,
+            best_bid=down_bid,
+            best_ask=down_ask,
+            last_trade=down_last,
+            ts=_time.time(),
         )
 
 
@@ -174,6 +226,10 @@ def _descriptor_from_event(event_obj: dict[str, Any]) -> EventDescriptor | None:
     end_ts = _iso_to_ts(event_obj.get("endDate") or market.get("endDate"))
     if end_ts <= 0:
         return None
+    outcome_prices_arr = _parse_stringified_array(market.get("outcomePrices"))
+    up_mid = _parse_float(outcome_prices_arr[0]) if len(outcome_prices_arr) >= 1 else 0.0
+    down_mid = _parse_float(outcome_prices_arr[1]) if len(outcome_prices_arr) >= 2 else 0.0
+    closed_flag = bool(event_obj.get("closed") or market.get("closed"))
     return EventDescriptor(
         event_id=str(event_obj.get("id") or market.get("id") or event_obj.get("slug", "")),
         slug=str(event_obj.get("slug") or market.get("slug") or ""),
@@ -183,6 +239,11 @@ def _descriptor_from_event(event_obj: dict[str, Any]) -> EventDescriptor | None:
         down_token_id=down_id,
         up_outcome_label=up_label,
         down_outcome_label=down_label,
+        closed=closed_flag,
+        best_bid=_parse_float(market.get("bestBid")),
+        best_ask=_parse_float(market.get("bestAsk")),
+        last_trade=_parse_float(market.get("lastTradePrice")),
+        outcome_prices=(up_mid, down_mid),
         raw=event_obj,
     )
 
@@ -221,47 +282,79 @@ class PolymarketClient:
         return await with_backoff(_call, max_attempts=4, base_delay=0.4, max_delay=4.0)
 
     async def find_active_btc_event(
-        self, *, series_slug: str = BTC_5M_SERIES_SLUG, now_ts: float | None = None
+        self,
+        *,
+        series_slug: str = BTC_5M_SERIES_SLUG,   # retained for API compat; unused
+        now_ts: float | None = None,
+        max_steps: int = 6,
     ) -> EventDescriptor | None:
-        """Query Gamma for the soonest-resolving active BTC 5-minute event.
+        """Discover the currently-tradable BTC 5-min event via direct-slug enumeration.
 
-        Returns ``None`` if no active event is currently open (e.g. between-events gap).
+        Polymarket's event slug is ``btc-updown-5m-<end_ts>`` where ``<end_ts>`` is
+        the unix-seconds endDate aligned to a 5-minute boundary. We compute the
+        next boundary ``ceil(now/300)*300`` and probe consecutive slugs with a
+        tight ``GET /events?slug=…`` — the ``series_slug=`` filter is unreliable,
+        this is the durable path.
+
+        Returns the first event hit whose ``closed=false`` and whose endDate is
+        still in the future. ``None`` if no event is live across the next
+        ``max_steps * 5`` minutes (treat as a transient outage).
         """
-        params = {
-            "series_slug": series_slug,
-            "closed": "false",
-            "limit": "10",
-            "order": "endDate",
-            "ascending": "true",
-        }
-        data = await self._get_json(f"{self._gamma}/events", params=params)
-        if not isinstance(data, list):
-            log.warning("gamma: unexpected response shape for /events: %s", type(data))
-            return None
+        import math
         import time as _time
 
         threshold = now_ts if now_ts is not None else _time.time()
-        # Pick first event whose endDate is still in the future and whose
-        # markets are active.
-        for event in data:
-            if event.get("closed") is True:
+        # Start from the CURRENT 5-min window (floor). The event with that
+        # slug is the one actively trading — its endDate is still in the
+        # future by up to 300s. If that one is closed/missing (just ended),
+        # fall through to the next window up. Using ceil() would miss the
+        # in-flight event every time the harness rolls over after a slow
+        # resolution poll, silently dropping every other event.
+        boundary = int(math.floor(threshold / 300.0) * 300)
+
+        for step in range(max_steps):
+            candidate_ts = boundary + step * 300
+            slug = f"btc-updown-5m-{candidate_ts}"
+            try:
+                data = await self._get_json(f"{self._gamma}/events", params={"slug": slug})
+            except httpx.HTTPStatusError as exc:
+                if exc.response.status_code == 404:
+                    continue
+                log.warning("gamma: %s probing %s", exc, slug)
                 continue
-            desc = _descriptor_from_event(event)
+            except Exception as exc:  # noqa: BLE001
+                log.warning("gamma: probe failed for %s: %s", slug, exc)
+                continue
+            if not isinstance(data, list) or not data:
+                continue
+            desc = _descriptor_from_event(data[0])
             if desc is None:
+                continue
+            if desc.closed:
                 continue
             if desc.end_date_ts <= threshold:
                 continue
             return desc
         return None
 
-    async def get_book(self, token_id: str) -> Book:
+    async def get_book(self, token_id: str) -> Book | None:
+        """Fetch a CLOB order book. Returns ``None`` on 404 / empty responses so
+        the harness can fall back to Gamma's top-of-book summary."""
         import time as _time
 
-        data = await self._get_json(f"{self._clob}/book", params={"token_id": token_id})
+        try:
+            data = await self._get_json(f"{self._clob}/book", params={"token_id": token_id})
+        except httpx.HTTPStatusError as exc:
+            if exc.response.status_code == 404:
+                return None
+            raise
         ts = _time.time()
         if not isinstance(data, dict):
             log.warning("clob: unexpected /book response for %s: %s", token_id, type(data))
-            data = {}
+            return None
+        # An empty book (both sides empty) is effectively useless — signal miss.
+        if not (data.get("bids") or data.get("asks") or data.get("bestBid") or data.get("bestAsk")):
+            return None
         return _parse_book(token_id, data, ts)
 
     async def get_event_by_slug(self, slug: str) -> EventDescriptor | None:
@@ -270,6 +363,11 @@ class PolymarketClient:
         if not isinstance(data, list) or not data:
             return None
         return _descriptor_from_event(data[0])
+
+    async def refresh_event(self, slug: str) -> EventDescriptor | None:
+        """Re-fetch an event by slug. Used every tick to refresh the in-memory
+        EventDescriptor's ``best_bid``/``best_ask``/``outcome_prices``/``closed``."""
+        return await self.get_event_by_slug(slug)
 
     async def get_outcome_prices(self, slug: str) -> tuple[float, float] | None:
         """Read the current ``outcomePrices`` for a market (by event slug).

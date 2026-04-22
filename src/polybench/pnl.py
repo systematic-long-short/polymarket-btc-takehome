@@ -25,23 +25,38 @@ log = logging.getLogger("polybench.pnl")
 
 @dataclass(frozen=True, slots=True)
 class BookTop:
-    """Minimal view of a single-token book top, enough to fill paper trades."""
+    """Minimal view of a single-token book top, enough to fill paper trades.
+
+    "Tradable" requires BOTH sides populated AND ask >= bid (not crossed).
+    A crossed or one-sided book is a transient glitch and attempting to
+    fill against it produces phantom PnL (e.g. buying at a fake $0.01 then
+    selling at $0.44 on the next tick when the real book returns).
+    """
 
     best_bid: float
     best_ask: float
     mid: float
 
     @property
+    def is_well_formed(self) -> bool:
+        return (
+            self.best_bid > 0.0
+            and self.best_ask > 0.0
+            and self.best_ask >= self.best_bid
+            and (self.best_ask - self.best_bid) < 0.5    # sanity: max 50-cent spread on a [0,1] market
+        )
+
+    @property
     def is_tradable(self) -> bool:
-        return self.best_bid > 0.0 and self.best_ask > 0.0
+        return self.is_well_formed
 
     @property
     def is_bid_tradable(self) -> bool:
-        return self.best_bid > 0.0
+        return self.is_well_formed
 
     @property
     def is_ask_tradable(self) -> bool:
-        return self.best_ask > 0.0
+        return self.is_well_formed
 
 
 @dataclass(frozen=True, slots=True)
@@ -163,11 +178,15 @@ class PaperSimulator:
         )
         resolution_pnl = payout - still_held_mtm
 
-        # Convert held shares to cash at resolution and flatten if resolved.
-        if resolved_known:
-            self.position.cash += payout
-            self.position.up_shares = 0.0
-            self.position.down_shares = 0.0
+        # Always flatten at event end: tokens from event A are NOT fungible
+        # with event B's tokens. If resolved, snap at $1/$0; otherwise cash
+        # out at the last observed mid prices (best approximation absent a
+        # resolution signal). Carrying positions across events produces
+        # nonsensical MTM because the share count would be re-priced at
+        # the next event's different tokens.
+        self.position.cash += payout
+        self.position.up_shares = 0.0
+        self.position.down_shares = 0.0
 
         # Determine outcome label.
         if resolved_known:

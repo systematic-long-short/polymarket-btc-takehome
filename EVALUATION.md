@@ -2,6 +2,12 @@
 
 Internal. Not distributed to candidates; candidates see `README.md`.
 
+> **Scoring runs land only against live Polymarket. There is no accepted
+> substitute.** Replay against the committed fixture is *iteration aid*, not
+> scoring evidence. If the scoring window has a network or Polymarket
+> outage, pause the run and restart — do NOT fall back to the fixture or to
+> any other price source for PnL.
+
 ## The scoring pass
 
 Run the candidate for a continuous **2-hour live window** (`--duration 7200`).

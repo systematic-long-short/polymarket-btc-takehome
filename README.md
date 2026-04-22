@@ -55,11 +55,12 @@ python replay.py --model polybench.baselines:MomentumBaseline \
 python scripts/run_baseline.py --model momentum --duration 300
 ```
 
-> **Heads up on live data:** Polymarket's 5-minute BTC up/down series runs
-> in bursts. If you see `no active BTC 5m event — waiting...` in the log
-> when running live, the series is currently paused — develop against the
-> committed replay fixture instead. The harness will automatically lock
-> onto the next event when one appears.
+> **Live scoring is Polymarket-only.** The harness auto-discovers the
+> currently-trading 5-min BTC event every ~3 seconds by enumerating the
+> canonical slug `btc-updown-5m-<end_ts>` directly from Gamma. When one
+> event resolves it rolls straight to the next, chaining ~12 events per hour
+> during the scoring run. If discovery genuinely fails, the run fails —
+> there is no synthetic or cross-exchange fallback for PnL.
 
 ---
 
@@ -247,15 +248,15 @@ DOWN-winning resolutions.
 To record your own fresh fixture from live data:
 
 ```bash
-# When live events are available:
+# Record a live Polymarket event (scoring-equivalent data):
 python scripts/run_baseline.py --model momentum --duration 600 \
     --output-dir runs/my_record
 cp runs/my_record/ticks.parquet tests/fixtures/my_event.parquet
-
-# When they're paused, synthesize from real BTC + synthetic Polymarket:
-python scripts/synthesize_fixture.py --duration 600 \
-    --output tests/fixtures/my_event.parquet
 ```
+
+`scripts/synthesize_fixture.py` also exists for purely-offline iteration
+when you have no internet. It is a **developer convenience only** — never
+used for scoring. See the banner in that file.
 
 ---
 
@@ -281,9 +282,11 @@ A: The harness writes `runs/<id>/ticks.parquet` with every tick's inputs,
 your signal, the fill, and your position. Open it with pandas/polars and
 investigate.
 
-**Q: Polymarket is paused — what do I develop against?**
-A: The committed replay fixture. Everything that replays correctly will
-run correctly live.
+**Q: Do I have to run live for every iteration?**
+A: For **scoring** yes — scoring happens only against the live market.
+For **fast iteration** use the committed replay fixture; everything that
+replays correctly will run correctly live. The fixture is not accepted as
+scoring evidence.
 
 **Q: Can I call external APIs (exchange book depth, sentiment feeds)?**
 A: Yes, but from a background thread if they're slow. The 500 ms budget

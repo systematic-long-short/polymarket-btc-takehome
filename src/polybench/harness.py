@@ -40,9 +40,10 @@ log = logging.getLogger("polybench.harness")
 DEFAULT_TICK_INTERVAL_S = 1.0
 DEFAULT_MODEL_BUDGET_S = 0.5
 DEFAULT_CLOB_POLL_INTERVAL_S = 1.0
-RESOLUTION_POLL_TIMEOUT_S = 60.0
+RESOLUTION_POLL_TIMEOUT_S = 45.0   # short live poll; postmortem pass catches lagging resolutions
 RESOLUTION_POLL_INTERVAL_S = 2.0
-EVENT_DISCOVERY_INTERVAL_S = 5.0
+EVENT_DISCOVERY_INTERVAL_S = 3.0   # probe Gamma every 3s while idle
+RESOLVED_EPSILON = 0.02            # |outcome_price - 1| < RESOLVED_EPSILON → resolved
 
 
 @dataclass
@@ -89,6 +90,7 @@ class Harness:
         self._cached_up_book: Book | None = None
         self._cached_down_book: Book | None = None
         self._up_mid_window: list[float] = []
+        self._btc_1hz_window: list[float] = []   # one sample per tick — what models see
         self._equity_curve: list[float] = []
         self._stop = asyncio.Event()
         self._clob_task: asyncio.Task | None = None
@@ -114,6 +116,11 @@ class Harness:
             if self._current_event is not None:
                 # Harness terminated mid-event — close with unknown resolution.
                 self._finish_current_event(time.time(), resolved=False, outcome=None)
+            # Post-mortem: any UNKNOWN events still in the simulator ledger get
+            # one last Gamma refresh — Polymarket sometimes lags the resolution
+            # flip by a few minutes, and this catches them without blocking the
+            # event rollover during the run.
+            await self._postmortem_resolve_unknowns()
             if self._own_pricefeed:
                 await self._pricefeed.stop()
             if self._own_client:
@@ -138,6 +145,12 @@ class Harness:
         while not self._stop.is_set():
             now = time.time()
             if now >= deadline:
+                # Grace: if an event is active and its endDate is within a
+                # minute past, let resolution poll complete rather than closing
+                # with UNKNOWN. Caps the extra wait at RESOLUTION_POLL_TIMEOUT_S.
+                if self._current_event is not None and now >= self._current_event.end_date_ts:
+                    log.info("harness: duration elapsed, resolving final event before stop")
+                    await self._resolve_and_rollover(now)
                 log.info("harness: duration elapsed, stopping")
                 return
 
@@ -172,56 +185,86 @@ class Harness:
                 await asyncio.sleep(sleep_for)
 
     async def _clob_poll_loop(self) -> None:
+        """Keep order books fresh.
+
+        Every interval: (a) refresh the Gamma event to pick up updated best_bid/
+        best_ask/outcome_prices, (b) try CLOB /book for each token, (c) fall back
+        to Gamma-synthesized top-of-book when CLOB returns None/empty. Guarantees
+        the tick loop always sees a non-empty book during a live event.
+        """
         while not self._stop.is_set():
             event = self._current_event
             if event is None:
                 await asyncio.sleep(0.5)
                 continue
+            # Refresh Gamma view of the event (best_bid/best_ask/outcome_prices).
+            try:
+                refreshed = await self._client.refresh_event(event.slug)
+                if refreshed is not None:
+                    self._current_event = refreshed
+                    event = refreshed
+            except Exception as exc:  # noqa: BLE001
+                log.debug("gamma refresh failed for %s: %s", event.slug, exc)
+            # Attempt CLOB depth; on miss, use Gamma summary.
+            up_book: Book | None = None
+            down_book: Book | None = None
             try:
                 up_book, down_book = await asyncio.gather(
                     self._client.get_book(event.up_token_id),
                     self._client.get_book(event.down_token_id),
                 )
-                self._cached_up_book = up_book
-                self._cached_down_book = down_book
             except Exception as exc:  # noqa: BLE001
-                log.warning("clob poll failed: %s", exc)
+                log.warning("clob poll errored (will use Gamma summary): %s", exc)
+            if up_book is None:
+                up_book = event.synth_up_book()
+            if down_book is None:
+                down_book = event.synth_down_book()
+            self._cached_up_book = up_book
+            self._cached_down_book = down_book
             await asyncio.sleep(self._cfg.clob_poll_interval_s)
 
     async def _discover_event(self, now: float) -> EventDescriptor | None:
         try:
-            event = await self._client.find_active_btc_event(
-                series_slug=self._cfg.series_slug, now_ts=now
-            )
+            event = await self._client.find_active_btc_event(now_ts=now)
         except Exception as exc:  # noqa: BLE001
             log.warning("gamma discovery failed: %s", exc)
             return None
         if event is None:
-            log.info("no active BTC 5m event — waiting...")
+            log.info("no active BTC 5m event yet (probed next ~30min of boundaries) — waiting %.0fs",
+                     EVENT_DISCOVERY_INTERVAL_S)
             return None
         log.info(
-            "locked onto event %s (ends in %.1fs)",
+            "locked onto event %s (ends in %.1fs, up_mid=%.4f)",
             event.slug,
             event.end_date_ts - now,
+            event.outcome_prices[0],
         )
         return event
 
     async def _prime_books_for(self, event: EventDescriptor) -> None:
-        # Seed the book cache immediately so the first tick has data.
+        """Seed the book cache immediately so the first tick has data.
+
+        Falls back to Gamma-synthesized top-of-book if CLOB 404s.
+        """
+        up_book: Book | None = None
+        down_book: Book | None = None
         try:
             up_book, down_book = await asyncio.gather(
                 self._client.get_book(event.up_token_id),
                 self._client.get_book(event.down_token_id),
             )
-            self._cached_up_book = up_book
-            self._cached_down_book = down_book
         except Exception as exc:  # noqa: BLE001
-            log.warning("failed to prime books for %s: %s", event.slug, exc)
-            self._cached_up_book = None
-            self._cached_down_book = None
+            log.warning("failed to prime CLOB books for %s (using Gamma): %s", event.slug, exc)
+        if up_book is None:
+            up_book = event.synth_up_book()
+        if down_book is None:
+            down_book = event.synth_down_book()
+        self._cached_up_book = up_book
+        self._cached_down_book = down_book
 
     def _on_event_start(self, event: EventDescriptor, now: float) -> None:
         self._up_mid_window.clear()
+        self._btc_1hz_window.clear()
         up_mid = self._cached_up_book.mid if self._cached_up_book else 0.5
         down_mid = self._cached_down_book.mid if self._cached_down_book else 0.5
         self._simulator.start_event(
@@ -238,22 +281,109 @@ class Harness:
         assert event is not None
         outcome = await self._poll_resolution(event)
         resolved = outcome is not None
-        self._finish_current_event(now, resolved=resolved, outcome=outcome)
+        if not resolved:
+            # Gamma's bestBid/bestAsk go stale after the market closes, but
+            # outcomePrices stay accurate (they're the UMA-reported market
+            # mid, snapping to 0/1 post-resolution). If we have even a close
+            # approximation from the last refresh, prefer those over the
+            # stale top-of-book for final flattening.
+            try:
+                refreshed = await self._client.refresh_event(event.slug)
+            except Exception:  # noqa: BLE001
+                refreshed = None
+            if refreshed is not None and sum(refreshed.outcome_prices) > 0.0:
+                outcome = refreshed.outcome_prices
+        self._finish_current_event(now, resolved=outcome is not None, outcome=outcome)
+
+    async def _postmortem_resolve_unknowns(
+        self,
+        *,
+        max_wait_s: float = 600.0,
+        poll_interval_s: float = 10.0,
+    ) -> None:
+        """After the run, re-query Gamma for events still marked UNKNOWN.
+
+        Polymarket sometimes lags its resolution flip by 60–180 s past
+        ``endDate``. The live ``_poll_resolution`` budget is short (so event
+        rollover stays tight), so this post-mortem is where lagging events
+        get upgraded. Retries every ``poll_interval_s`` until all events
+        resolve or ``max_wait_s`` elapses.
+        """
+        import dataclasses as _dc
+        events = self._simulator._completed_events
+        if not events:
+            return
+        deadline = time.time() + max_wait_s
+        total_upgraded = 0
+        iteration = 0
+        while time.time() < deadline:
+            iteration += 1
+            unknown_indices = [
+                i for i, e in enumerate(events) if e.resolved_outcome == "UNKNOWN"
+            ]
+            if not unknown_indices:
+                break
+            log.info(
+                "postmortem iter %d: %d UNKNOWN events remaining",
+                iteration,
+                len(unknown_indices),
+            )
+            iter_upgraded = 0
+            for idx in unknown_indices:
+                ev = events[idx]
+                try:
+                    refreshed = await self._client.refresh_event(ev.slug)
+                except Exception as exc:  # noqa: BLE001
+                    log.debug("postmortem refresh failed for %s: %s", ev.slug, exc)
+                    continue
+                if refreshed is None:
+                    continue
+                up, down = refreshed.outcome_prices
+                if up > (1.0 - RESOLVED_EPSILON) and down < RESOLVED_EPSILON:
+                    label = "UP"
+                elif down > (1.0 - RESOLVED_EPSILON) and up < RESOLVED_EPSILON:
+                    label = "DOWN"
+                elif refreshed.closed:
+                    label = "UP" if up >= down else "DOWN"
+                else:
+                    continue
+                events[idx] = _dc.replace(ev, resolved_outcome=label)
+                iter_upgraded += 1
+                total_upgraded += 1
+            if iter_upgraded == 0:
+                # None upgraded this round — wait before retry.
+                remaining = [i for i, e in enumerate(events) if e.resolved_outcome == "UNKNOWN"]
+                if not remaining:
+                    break
+                await asyncio.sleep(poll_interval_s)
+        if total_upgraded:
+            log.info("postmortem: upgraded %d UNKNOWN events to resolved", total_upgraded)
 
     async def _poll_resolution(
         self, event: EventDescriptor
     ) -> tuple[float, float] | None:
+        """Poll the same Gamma slug until ``closed=true`` and outcomePrices
+        saturate to [1,0] or [0,1]. No cross-source fallback — if Polymarket
+        hasn't resolved within the timeout, return ``None`` (UNKNOWN)."""
         deadline = time.time() + RESOLUTION_POLL_TIMEOUT_S
         while time.time() < deadline and not self._stop.is_set():
             try:
-                prices = await self._client.get_outcome_prices(event.slug)
+                refreshed = await self._client.refresh_event(event.slug)
             except Exception as exc:  # noqa: BLE001
-                log.warning("outcome poll failed: %s", exc)
-                prices = None
-            if prices is not None:
-                up, down = prices
-                # Resolved when one side snaps to 1 and the other to 0.
-                if (up > 0.98 and down < 0.02) or (down > 0.98 and up < 0.02):
+                log.warning("resolution poll (refresh) failed: %s", exc)
+                refreshed = None
+            if refreshed is not None:
+                up, down = refreshed.outcome_prices
+                is_resolved_up = up > (1.0 - RESOLVED_EPSILON) and down < RESOLVED_EPSILON
+                is_resolved_down = down > (1.0 - RESOLVED_EPSILON) and up < RESOLVED_EPSILON
+                # Accept resolution if EITHER Gamma flags closed=true OR the
+                # outcomePrices saturate. Polymarket's closed flag lags the
+                # price saturation by 10–60s on many events.
+                if is_resolved_up or is_resolved_down:
+                    return (up, down)
+                if refreshed.closed:
+                    # closed but not saturated → weird; treat as resolved with
+                    # whatever prices are there.
                     return (up, down)
             await asyncio.sleep(RESOLUTION_POLL_INTERVAL_S)
         log.warning(
@@ -327,10 +457,15 @@ class Harness:
         down_book = self._cached_down_book
         price_snap = self._pricefeed.snapshot()
 
-        # Update rolling UP mid window.
+        # Update 1 Hz rolling windows (one sample per tick so candidate models
+        # can reason about time-aligned history without sub-second noise).
         self._up_mid_window.append(up_book.mid)
         if len(self._up_mid_window) > self._cfg.price_window_size:
             self._up_mid_window.pop(0)
+        if price_snap.last > 0.0:
+            self._btc_1hz_window.append(price_snap.last)
+            if len(self._btc_1hz_window) > self._cfg.price_window_size:
+                self._btc_1hz_window.pop(0)
 
         tick = Tick(
             ts=now,
@@ -344,7 +479,7 @@ class Harness:
             down_bid=down_book.best_bid,
             down_ask=down_book.best_ask,
             down_mid=down_book.mid,
-            btc_recent=price_snap.window,
+            btc_recent=tuple(self._btc_1hz_window),
             up_mid_recent=tuple(self._up_mid_window),
             event_id=self._current_event.event_id,
         )

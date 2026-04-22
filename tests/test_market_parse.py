@@ -129,30 +129,219 @@ def _mock_transport(handler):
     return httpx.MockTransport(handler)
 
 
+def _make_live_event(slug: str, *, closed: bool = False, end_iso: str = "2099-12-31T23:59:00Z") -> list:
+    return [
+        {
+            "id": f"E-{slug}",
+            "slug": slug,
+            "title": "Bitcoin Up or Down — 5 Minutes?",
+            "endDate": end_iso,
+            "active": True,
+            "closed": closed,
+            "markets": [
+                {
+                    "id": f"M-{slug}",
+                    "clobTokenIds": '["UP", "DOWN"]',
+                    "outcomes": '["Up", "Down"]',
+                    "outcomePrices": '["0.505", "0.495"]',
+                    "bestBid": "0.50",
+                    "bestAsk": "0.51",
+                    "lastTradePrice": "0.505",
+                }
+            ],
+        }
+    ]
+
+
 @pytest.mark.asyncio
-async def test_find_active_event_uses_series_slug() -> None:
-    seen_params: dict = {}
+async def test_find_active_event_enumerates_slugs_exact_hit() -> None:
+    """Discovery probes the current 5-min window (floor) first and falls
+    forward to the next window if that one is empty. When the hit slug is
+    the ceil(now/300)*300 boundary, we should find it within 2 probes."""
+    import math, time
+    hit_boundary = int(math.ceil(time.time() / 300.0) * 300)
+    hit_slug = f"btc-updown-5m-{hit_boundary}"
+    seen_slugs: list[str] = []
 
     def handler(request: httpx.Request) -> httpx.Response:
-        seen_params.update(dict(request.url.params))
-        return httpx.Response(200, json=GAMMA_EVENT_RESPONSE)
+        slug = request.url.params.get("slug", "")
+        seen_slugs.append(slug)
+        if slug == hit_slug:
+            return httpx.Response(200, json=_make_live_event(slug))
+        return httpx.Response(200, json=[])
 
     client = PolymarketClient()
-    # Swap in a mock transport on the underlying AsyncClient.
     await client._http.aclose()
-    client._http = httpx.AsyncClient(
-        transport=_mock_transport(handler),
-        base_url="",
-    )
+    client._http = httpx.AsyncClient(transport=_mock_transport(handler))
     try:
         desc = await client.find_active_btc_event()
         assert desc is not None
+        assert desc.slug == hit_slug
         assert desc.up_token_id == "UP"
         assert desc.down_token_id == "DOWN"
-        assert seen_params["series_slug"] == BTC_5M_SERIES_SLUG
-        assert seen_params["closed"] == "false"
+        assert desc.best_bid == 0.50
+        assert desc.best_ask == 0.51
+        assert desc.outcome_prices == (0.505, 0.495)
+        # Hit within the first 2 probes (floor-then-ceil).
+        assert hit_slug in seen_slugs[:2]
     finally:
         await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_find_active_event_falls_through_to_next_boundary() -> None:
+    """First slug empty → probe +300 → hit."""
+    import math, time
+    expected_boundary = int(math.ceil(time.time() / 300.0) * 300)
+    hit_slug = f"btc-updown-5m-{expected_boundary + 300}"
+    seen_slugs: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        slug = request.url.params.get("slug", "")
+        seen_slugs.append(slug)
+        if slug == hit_slug:
+            return httpx.Response(200, json=_make_live_event(slug))
+        return httpx.Response(200, json=[])
+
+    client = PolymarketClient()
+    await client._http.aclose()
+    client._http = httpx.AsyncClient(transport=_mock_transport(handler))
+    try:
+        desc = await client.find_active_btc_event()
+        assert desc is not None
+        assert desc.slug == hit_slug
+        assert len(seen_slugs) >= 2           # probed at least two slugs
+        assert seen_slugs[0] != hit_slug      # first one missed
+    finally:
+        await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_find_active_event_skips_closed_events() -> None:
+    """A closed event is not returned; enumerator keeps probing."""
+    import math, time
+    expected_boundary = int(math.ceil(time.time() / 300.0) * 300)
+    closed_slug = f"btc-updown-5m-{expected_boundary}"
+    open_slug = f"btc-updown-5m-{expected_boundary + 300}"
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        slug = request.url.params.get("slug", "")
+        if slug == closed_slug:
+            return httpx.Response(200, json=_make_live_event(slug, closed=True))
+        if slug == open_slug:
+            return httpx.Response(200, json=_make_live_event(slug))
+        return httpx.Response(200, json=[])
+
+    client = PolymarketClient()
+    await client._http.aclose()
+    client._http = httpx.AsyncClient(transport=_mock_transport(handler))
+    try:
+        desc = await client.find_active_btc_event()
+        assert desc is not None
+        assert desc.slug == open_slug
+    finally:
+        await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_find_active_event_returns_none_when_no_live_slot() -> None:
+    """Every probe returns empty → None (treated as transient outage)."""
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json=[])
+
+    client = PolymarketClient()
+    await client._http.aclose()
+    client._http = httpx.AsyncClient(transport=_mock_transport(handler))
+    try:
+        desc = await client.find_active_btc_event()
+        assert desc is None
+    finally:
+        await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_refresh_event_returns_fresh_descriptor() -> None:
+    """refresh_event re-fetches a slug and returns a new descriptor with updated quotes."""
+    import math, time
+    expected_boundary = int(math.ceil(time.time() / 300.0) * 300)
+    slug = f"btc-updown-5m-{expected_boundary}"
+
+    call_count = {"n": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        call_count["n"] += 1
+        if call_count["n"] == 1:
+            payload = _make_live_event(slug)
+        else:
+            # Updated quotes on second fetch
+            payload = _make_live_event(slug)
+            payload[0]["markets"][0]["bestBid"] = "0.55"
+            payload[0]["markets"][0]["bestAsk"] = "0.56"
+            payload[0]["markets"][0]["outcomePrices"] = '["0.555", "0.445"]'
+        return httpx.Response(200, json=payload)
+
+    client = PolymarketClient()
+    await client._http.aclose()
+    client._http = httpx.AsyncClient(transport=_mock_transport(handler))
+    try:
+        d1 = await client.refresh_event(slug)
+        d2 = await client.refresh_event(slug)
+        assert d1 is not None and d2 is not None
+        assert d1.best_bid == 0.50
+        assert d2.best_bid == 0.55
+        assert d2.outcome_prices == (0.555, 0.445)
+    finally:
+        await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_get_book_returns_none_on_404() -> None:
+    """CLOB 404 must return None so the harness can fall back to Gamma summary."""
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(404, json={"error": "not found"})
+
+    client = PolymarketClient()
+    await client._http.aclose()
+    client._http = httpx.AsyncClient(transport=_mock_transport(handler))
+    try:
+        book = await client.get_book("MISSING_TOKEN")
+        assert book is None
+    finally:
+        await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_get_book_returns_none_on_empty_payload() -> None:
+    """An empty book response is treated as a miss."""
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={})
+
+    client = PolymarketClient()
+    await client._http.aclose()
+    client._http = httpx.AsyncClient(transport=_mock_transport(handler))
+    try:
+        book = await client.get_book("EMPTY_TOKEN")
+        assert book is None
+    finally:
+        await client.aclose()
+
+
+def test_descriptor_synth_up_down_books_are_complementary() -> None:
+    """UP bid/ask + DOWN bid/ask should sum to ~1 via 1 − p arbitrage."""
+    from polybench.market import EventDescriptor
+
+    desc = EventDescriptor(
+        event_id="E", slug="btc-updown-5m-x", question="q",
+        end_date_ts=9e10, up_token_id="UP", down_token_id="DOWN",
+        up_outcome_label="Up", down_outcome_label="Down",
+        best_bid=0.48, best_ask=0.52, last_trade=0.50,
+        outcome_prices=(0.50, 0.50),
+    )
+    up = desc.synth_up_book()
+    down = desc.synth_down_book()
+    assert up.best_bid == 0.48 and up.best_ask == 0.52
+    assert down.best_bid == pytest.approx(1 - 0.52, abs=1e-9)
+    assert down.best_ask == pytest.approx(1 - 0.48, abs=1e-9)
 
 
 @pytest.mark.asyncio

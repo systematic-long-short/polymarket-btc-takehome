@@ -1,12 +1,17 @@
 #!/usr/bin/env python
-"""Synthesize a realistic replay fixture when live Polymarket events
-are unavailable (e.g. between series, paused markets).
+"""DEVELOPER-ITERATION TOOL — NOT USED FOR SCORING.
+
+Synthesizes a replay-compatible parquet from real Binance BTC prices plus
+heuristic Polymarket token prices. Intended for offline iteration when you
+don't have internet access to Polymarket.
+
+    Scoring is performed EXCLUSIVELY against the live Polymarket market by
+    `scripts/run_baseline.py` / `scripts/run_candidate.py`. The output of
+    this script is never accepted as scoring evidence. See EVALUATION.md.
 
 Captures real BTC prices from the Binance WebSocket over the requested
 duration, then synthesizes Polymarket UP/DOWN token prices whose mid
-responds to BTC momentum — realistic enough for offline candidate
-iteration without needing Polymarket to be actively running a 5-min
-BTC event.
+responds to BTC momentum.
 
 Usage:
     python scripts/synthesize_fixture.py --duration 600 \\

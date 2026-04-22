@@ -131,6 +131,39 @@ def test_flat_signal_closes_existing_positions() -> None:
     assert sim.position.up_shares == 0.0
 
 
+def test_one_sided_book_rejects_fills() -> None:
+    """A book with only a bid and no ask (or vice versa) must not fill.
+
+    Regression: a transient empty-ask tick synthesized a 1.0/0.01 DOWN
+    book via 1-p arbitrage which allowed buying 36,000 shares at a fake
+    $0.01, locking in phantom profit when the real book returned.
+    """
+    sim = PaperSimulator(starting_capital=1000.0, slippage_bps=0.0)
+    sim.start_event("E1", "ev1", ts=0.0, up_mid=0.5, down_mid=0.5)
+    # UP has a bid but no ask — not tradable.
+    degenerate_up = BookTop(best_bid=0.99, best_ask=0.0, mid=0.5)
+    # DOWN has the inverted arbitrage crossed book: bid=1.0, ask=0.01.
+    crossed_down = BookTop(best_bid=1.0, best_ask=0.01, mid=0.5)
+    fills = sim.apply_signal(
+        Signal(side=Side.DOWN, size=1.0),
+        degenerate_up,
+        crossed_down,
+    )
+    assert fills == []
+    assert sim.position.up_shares == 0.0
+    assert sim.position.down_shares == 0.0
+
+
+def test_wildly_wide_spread_rejects_fills() -> None:
+    """A >50-cent spread on a [0,1] market is treated as no real market."""
+    sim = PaperSimulator(starting_capital=1000.0, slippage_bps=0.0)
+    sim.start_event("E1", "ev1", ts=0.0, up_mid=0.5, down_mid=0.5)
+    wide = BookTop(best_bid=0.01, best_ask=0.99, mid=0.5)
+    fine = BookTop(best_bid=0.45, best_ask=0.46, mid=0.455)
+    fills = sim.apply_signal(Signal(side=Side.UP, size=1.0), wide, fine)
+    assert fills == []
+
+
 def test_timeout_counted_per_tick() -> None:
     sim = PaperSimulator(starting_capital=1000.0, slippage_bps=0.0)
     sim.start_event("E1", "ev1", ts=0.0, up_mid=0.5, down_mid=0.5)

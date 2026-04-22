@@ -1,6 +1,6 @@
 # polymarket-btc-takehome
 
-A take-home project for quant / ML candidates.
+A take-home project for technical candidates.
 
 You write a Python model that emits buy / sell / flat signals every second
 against Polymarket's 5-minute BTC up/down event. We paper-trade your signal

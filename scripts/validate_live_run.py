@@ -38,6 +38,11 @@ def _expected_score(metrics: dict[str, Any]) -> float:
     return pnl * sharpe * max(0.0, 1.0 - drawdown)
 
 
+def _positive_rows(df: pd.DataFrame, columns: tuple[str, ...]) -> pd.Series:
+    frame = df[list(columns)].apply(pd.to_numeric, errors="coerce")
+    return frame.gt(0.0).all(axis=1)
+
+
 def _validate_track(payload: dict[str, Any], track: str, *, min_events: int, min_ticks: int) -> dict[str, Any]:
     section = payload[track]
     metrics = section["metrics"]
@@ -93,16 +98,28 @@ def validate_live_run(
     model = _validate_track(payload, "model", min_events=min_events, min_ticks=min_ticks)
     baseline = _validate_track(payload, "baseline", min_events=min_events, min_ticks=min_ticks)
 
-    poly_cols = ("up_bid", "up_ask", "up_mid", "down_bid", "down_ask", "down_mid")
+    poly_mid_cols = ("up_mid", "down_mid")
+    poly_quote_cols = ("up_bid", "up_ask", "down_bid", "down_ask")
+    poly_cols = poly_quote_cols + poly_mid_cols
     btc_cols = ("btc_last", "btc_bid", "btc_ask")
     for col in poly_cols:
         _require(col in df.columns, f"missing Polymarket column {col}")
     for col in btc_cols:
         _require(col in df.columns, f"missing BTC column {col}")
 
-    poly_rows = int((df[list(poly_cols)] > 0.0).all(axis=1).sum())
-    btc_rows = int((df[list(btc_cols)] > 0.0).all(axis=1).sum())
-    _require(poly_rows >= min_ticks, "too few rows have complete Polymarket quotes")
+    if "resolved_outcome" in df.columns:
+        active_mask = df["resolved_outcome"].fillna("").astype(str).eq("")
+    else:
+        active_mask = pd.Series(True, index=df.index)
+    active_df = df.loc[active_mask]
+
+    poly_valid_mask = _positive_rows(active_df, poly_mid_cols)
+    poly_two_sided_mask = poly_valid_mask & _positive_rows(active_df, poly_quote_cols)
+    poly_valid_rows = int(poly_valid_mask.sum())
+    poly_two_sided_rows = int(poly_two_sided_mask.sum())
+    poly_one_sided_rows = poly_valid_rows - poly_two_sided_rows
+    btc_rows = int(_positive_rows(active_df, btc_cols).sum())
+    _require(poly_valid_rows >= min_ticks, "too few rows have valid Polymarket mids")
     _require(btc_rows >= min_ticks, "too few rows have complete BTC quotes")
 
     sources: list[str] = []
@@ -110,7 +127,7 @@ def validate_live_run(
         sources = sorted(str(s) for s in df["btc_source"].dropna().unique())
     if require_binance:
         _require("btc_source" in df.columns, "ticks parquet lacks btc_source")
-        binance_rows = int(df["btc_source"].astype(str).str.startswith("binance").sum())
+        binance_rows = int(df.loc[active_mask, "btc_source"].astype(str).str.startswith("binance").sum())
         _require(binance_rows >= min_ticks, "too few rows identify Binance as BTC source")
 
     if not allow_unknown:
@@ -123,7 +140,11 @@ def validate_live_run(
         "report_duration_s": report_duration,
         "tick_duration_s": tick_duration,
         "tick_rows": int(len(df)),
-        "polymarket_complete_rows": poly_rows,
+        "active_tick_rows": int(len(active_df)),
+        "settlement_rows": int(len(df) - len(active_df)),
+        "polymarket_valid_rows": poly_valid_rows,
+        "polymarket_two_sided_rows": poly_two_sided_rows,
+        "polymarket_one_sided_rows": poly_one_sided_rows,
         "btc_complete_rows": btc_rows,
         "btc_sources": sources,
         "model": model,

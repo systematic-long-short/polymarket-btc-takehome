@@ -242,7 +242,10 @@ not require Binance/Coinbase WebSockets. Evaluators can opt into an auxiliary
 BTC feed with `--price-source binance`, `binance-us`, or `coinbase`. When this
 is enabled, recorded `ticks.parquet` rows contain both Polymarket UP/DOWN
 order-book fields and Binance/Coinbase BTC fields, with `btc_source` naming
-the active BTC feed.
+the active BTC feed. The live validator reports `polymarket_valid_rows`
+(active rows with usable UP/DOWN mids), `polymarket_two_sided_rows` (both
+bid and ask populated for both tokens), and `polymarket_one_sided_rows`
+(valid rows where one bid/ask is zero, which can happen near resolution).
 
 To run the dual-feed example live for a full scoring hour:
 

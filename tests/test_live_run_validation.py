@@ -89,6 +89,9 @@ def test_validate_live_run_accepts_dual_feed_tick_data(
     df = pd.read_parquet(synthetic_fixture)
     df = df.iloc[:601].copy()
     df["ts"] = [1_700_000_000.0 + i for i in range(len(df))]
+    df["resolved_outcome"] = ""
+    df.loc[:49, "up_ask"] = 0.0
+    df.loc[:49, "down_bid"] = 0.0
     df["btc_source"] = "binance"
     df.to_parquet(ticks, engine="pyarrow", index=False)
 
@@ -100,6 +103,9 @@ def test_validate_live_run_accepts_dual_feed_tick_data(
         require_binance=True,
     )
     assert summary["btc_sources"] == ["binance"]
+    assert summary["polymarket_valid_rows"] == 601
+    assert summary["polymarket_two_sided_rows"] == 551
+    assert summary["polymarket_one_sided_rows"] == 50
     assert summary["model"]["primary_score"] == 194.0
 
 
@@ -138,6 +144,30 @@ def test_validate_live_run_requires_binance_source(
     df.to_parquet(ticks, engine="pyarrow", index=False)
 
     with pytest.raises(AssertionError, match="Binance"):
+        validate_live_run(
+            report_path=report,
+            ticks_path=ticks,
+            min_duration_s=600.0,
+            min_events=2,
+            require_binance=True,
+        )
+
+
+def test_validate_live_run_rejects_missing_polymarket_mids(
+    synthetic_fixture: Path, tmp_path: Path
+) -> None:
+    report = tmp_path / "report.json"
+    ticks = tmp_path / "ticks.parquet"
+    _write_report(report)
+
+    df = pd.read_parquet(synthetic_fixture).iloc[:601].copy()
+    df["ts"] = [1_700_000_000.0 + i for i in range(len(df))]
+    df["resolved_outcome"] = ""
+    df.loc[:250, "up_mid"] = 0.0
+    df["btc_source"] = "binance"
+    df.to_parquet(ticks, engine="pyarrow", index=False)
+
+    with pytest.raises(AssertionError, match="valid Polymarket mids"):
         validate_live_run(
             report_path=report,
             ticks_path=ticks,

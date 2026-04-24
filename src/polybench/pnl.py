@@ -106,7 +106,7 @@ class PaperSimulator:
     def __init__(
         self,
         starting_capital: float = 1000.0,
-        slippage_bps: float = 200.0,   # 2% = 200 basis points
+        slippage_bps: float = 50.0,    # 0.5% = 50 basis points per order
         fee_rate: float = 0.072,        # Polymarket-style per-trade fee coefficient
     ) -> None:
         self._starting_capital = float(starting_capital)

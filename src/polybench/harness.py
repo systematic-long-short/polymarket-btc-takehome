@@ -54,7 +54,7 @@ class HarnessConfig:
     model_budget_s: float = DEFAULT_MODEL_BUDGET_S
     clob_poll_interval_s: float = DEFAULT_CLOB_POLL_INTERVAL_S
     starting_capital: float = 1000.0
-    slippage_bps: float = 200.0
+    slippage_bps: float = 50.0
     fee_rate: float = 0.072   # Polymarket-style per-trade fee coefficient
     price_source: str = "polymarket"
     price_window_size: int = 300
@@ -446,14 +446,16 @@ class Harness:
         baseline_result = self._baseline_simulator.finish_event(now, up_price, down_price)
         # Write a settlement row — both model and baseline tracks land at the
         # same event boundary, so one row carries both snapshots.
+        price_snap = self._pricefeed.snapshot()
         row = TickRow(
             ts=now,
             event_id=event.event_id,
             slug=event.slug,
             time_to_resolve=0.0,
-            btc_last=self._pricefeed.snapshot().last,
-            btc_bid=self._pricefeed.snapshot().bid,
-            btc_ask=self._pricefeed.snapshot().ask,
+            btc_last=price_snap.last,
+            btc_bid=price_snap.bid,
+            btc_ask=price_snap.ask,
+            btc_source=price_snap.source,
             up_bid=self._cached_up_book.best_bid if self._cached_up_book else 0.0,
             up_ask=self._cached_up_book.best_ask if self._cached_up_book else 0.0,
             up_mid=self._cached_up_book.mid if self._cached_up_book else 0.0,
@@ -523,6 +525,7 @@ class Harness:
             btc_last=price_snap.last,
             btc_bid=price_snap.bid,
             btc_ask=price_snap.ask,
+            btc_source=price_snap.source,
             up_bid=up_book.best_bid,
             up_ask=up_book.best_ask,
             up_mid=up_book.mid,
@@ -565,6 +568,7 @@ class Harness:
             btc_last=tick.btc_last,
             btc_bid=tick.btc_bid,
             btc_ask=tick.btc_ask,
+            btc_source=tick.btc_source,
             up_bid=tick.up_bid,
             up_ask=tick.up_ask,
             up_mid=tick.up_mid,
@@ -776,7 +780,7 @@ async def run_model(
     duration_s: float,
     output_dir: Path | str = "runs/latest",
     starting_capital: float = 1000.0,
-    slippage_bps: float = 200.0,
+    slippage_bps: float = 50.0,
     price_source: str = "polymarket",
     tick_interval_s: float = DEFAULT_TICK_INTERVAL_S,
     model_budget_s: float = DEFAULT_MODEL_BUDGET_S,

@@ -94,7 +94,7 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--class", dest="class_name", default="ModelSubmission")
     p.add_argument("--duration", type=float, default=7200.0)
     p.add_argument("--starting-capital", type=float, default=1000.0)
-    p.add_argument("--slippage-bps", type=float, default=200.0)
+    p.add_argument("--slippage-bps", type=float, default=50.0)
     p.add_argument("--fee-rate", type=float, default=0.072,
                    help="Polymarket-style fee coefficient")
     p.add_argument("--price-source", default="polymarket",

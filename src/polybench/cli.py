@@ -155,7 +155,7 @@ def build_parser() -> argparse.ArgumentParser:
     r.add_argument("--tick-interval", type=float, default=1.0)
     r.add_argument("--model-budget", type=float, default=0.5, help="on_tick wall-clock budget (s)")
     r.add_argument("--starting-capital", type=float, default=1000.0)
-    r.add_argument("--slippage-bps", type=float, default=200.0, help="Default 200 = 2%%")
+    r.add_argument("--slippage-bps", type=float, default=50.0, help="Default 50 = 0.5%% per order")
     r.add_argument("--fee-rate", type=float, default=0.072,
                    help="Polymarket-style fee coefficient (0.072 = ~1.8%% at p=0.5)")
     r.add_argument(
@@ -172,7 +172,7 @@ def build_parser() -> argparse.ArgumentParser:
     _add_model_args(p_r)
     p_r.add_argument("--data", required=True, help="Path to recorded ticks parquet")
     p_r.add_argument("--starting-capital", type=float, default=1000.0)
-    p_r.add_argument("--slippage-bps", type=float, default=200.0)
+    p_r.add_argument("--slippage-bps", type=float, default=50.0)
     p_r.add_argument("--fee-rate", type=float, default=0.072,
                      help="Polymarket-style fee coefficient")
     p_r.add_argument("--output-dir", default="runs/replay")

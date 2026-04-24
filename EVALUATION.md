@@ -92,7 +92,7 @@ A submission **fails fast** if:
 - Do they explain WHY their signal should work? "Order book imbalance
   predicts Polymarket mid-drift" is a testable hypothesis. "A neural net
   learned the pattern" is not.
-- Do they acknowledge spread + slippage + fees? The default 2% slippage
+- Do they acknowledge spread + slippage + fees? The default 0.5% per-order slippage
   plus up-to-1.8% fee at p=0.5 adds up; a frequently-trading strategy
   needs signal strong enough to overcome it.
 - Do they describe the failure mode? If BTC goes flat, what does their

@@ -27,7 +27,7 @@ log = logging.getLogger("polybench.replay")
 @dataclass
 class ReplayConfig:
     starting_capital: float = 1000.0
-    slippage_bps: float = 200.0
+    slippage_bps: float = 50.0
     fee_rate: float = 0.072
     model_budget_s: float = 0.5
     output_dir: Path = Path("runs/replay")
@@ -152,6 +152,7 @@ def replay(
 
         # Update rolling windows from the recorded row.
         btc_last = float(row.btc_last)
+        btc_source = str(getattr(row, "btc_source", "recorded") or "recorded")
         up_mid = float(row.up_mid)
         if btc_last > 0.0 and not math.isnan(btc_last):
             btc_window.append(btc_last)
@@ -173,6 +174,7 @@ def replay(
             btc_recent=tuple(btc_window),
             up_mid_recent=tuple(up_mid_window),
             event_id=event_id,
+            btc_source=btc_source,
         )
 
         signal_out = _safe_on_tick(model, tick)

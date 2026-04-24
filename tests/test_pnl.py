@@ -21,6 +21,11 @@ def test_initial_state_is_cash_only() -> None:
     assert sim.position.down_shares == 0.0
 
 
+def test_default_slippage_is_half_percent_per_order() -> None:
+    sim = PaperSimulator(starting_capital=1000.0, fee_rate=0.0)
+    assert sim.slippage_bps == pytest.approx(50.0)
+
+
 def test_full_size_up_buy_at_ask_with_slippage() -> None:
     # 2% slippage: buying 1000 USD of UP at ask=0.50 ⇒ fill at 0.51 ⇒ 1960.78 shares.
     sim = PaperSimulator(starting_capital=1000.0, slippage_bps=200.0, fee_rate=0.0)

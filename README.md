@@ -75,6 +75,7 @@ class Tick:
     btc_last: float            # optional BTC spot feed; 0 in default Polymarket-only live runs
     btc_bid: float             # optional BTC bid; 0 in default Polymarket-only live runs
     btc_ask: float             # optional BTC ask; 0 in default Polymarket-only live runs
+    btc_source: str            # "polymarket", "binance", "binance-us", or "coinbase"
 
     up_bid: float              # Polymarket UP token best bid (in $0–$1)
     up_ask: float
@@ -183,7 +184,7 @@ scanner rejects it statically.
 send a signal, the simulator executes the delta against the current
 Polymarket order book:
 
-- Buys fill at `best_ask × (1 + slippage)` (default slippage 2%).
+- Buys fill at `best_ask × (1 + slippage)` (default slippage 0.5% per order).
 - Sells fill at `best_bid × (1 − slippage)`.
 - Every fill also pays a Polymarket-style fee of
   `|notional| × fee_rate × p × (1 − p)` where `p` is the fill price in
@@ -238,8 +239,30 @@ python scripts/run_baseline.py --duration 300
 The official live path is **Polymarket-only by default**. It discovers the
 active BTC 5-minute event from Gamma and polls Polymarket order books; it does
 not require Binance/Coinbase WebSockets. Evaluators can opt into an auxiliary
-BTC feed with `--price-source binance`, `binance-us`, or `coinbase`, but that
-is not required for scoring.
+BTC feed with `--price-source binance`, `binance-us`, or `coinbase`. When this
+is enabled, recorded `ticks.parquet` rows contain both Polymarket UP/DOWN
+order-book fields and Binance/Coinbase BTC fields, with `btc_source` naming
+the active BTC feed.
+
+To run the dual-feed example live for a full scoring hour:
+
+```bash
+python scripts/run_candidate.py \
+    --submission model_submissions/dual_feed_momentum/model_submission.py \
+    --duration 3600 \
+    --price-source binance \
+    --output runs/live_1h_dual_feed
+
+python scripts/validate_live_run.py \
+    --report runs/live_1h_dual_feed/report.json \
+    --ticks runs/live_1h_dual_feed/ticks.parquet \
+    --min-duration 3600 \
+    --min-events 10 \
+    --require-binance
+```
+
+For a scanner-safe reference strategy matching the built-in benchmark, use
+`model_submissions/reference_momentum/model_submission.py` with the same command.
 
 ---
 

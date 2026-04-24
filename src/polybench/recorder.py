@@ -8,6 +8,7 @@ Schema (one row per tick):
     btc_last             float64
     btc_bid              float64
     btc_ask              float64
+    btc_source           string    source for BTC fields; e.g. binance
     up_bid               float64   Polymarket UP token best bid
     up_ask               float64
     up_mid               float64
@@ -52,6 +53,7 @@ class TickRow:
     btc_last: float = 0.0
     btc_bid: float = 0.0
     btc_ask: float = 0.0
+    btc_source: str = "polymarket"
     up_bid: float = 0.0
     up_ask: float = 0.0
     up_mid: float = 0.0
@@ -123,7 +125,14 @@ class Recorder:
 
 
 def _default_for(column: str) -> Any:
-    if column in {"event_id", "slug", "signal_side", "baseline_signal_side", "resolved_outcome"}:
+    if column in {
+        "event_id",
+        "slug",
+        "btc_source",
+        "signal_side",
+        "baseline_signal_side",
+        "resolved_outcome",
+    }:
         return "NONE" if column in {"signal_side", "baseline_signal_side"} else ""
     if column in {"timeout", "baseline_timeout"}:
         return False

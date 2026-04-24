@@ -1,0 +1,8 @@
+{
+  "lookback_s": 30,
+  "threshold_bps": 5.0,
+  "size_cap": 1.0,
+  "bps_per_unit": 20.0,
+  "pm_threshold": 0.01,
+  "pm_per_unit": 0.08
+}

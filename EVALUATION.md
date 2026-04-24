@@ -15,6 +15,10 @@ The harness chains ~24 consecutive 5-min BTC events back-to-back and always
 runs `MomentumBaseline` in parallel on the same tape, so a single run
 produces the apples-to-apples Model-vs-Baseline comparison.
 
+Use the default `--price-source polymarket` unless you are intentionally
+debugging an auxiliary BTC spot feed. Official scoring should depend only on
+Polymarket Gamma/CLOB availability.
+
 ```bash
 # Set up a fresh working dir per candidate.
 mkdir -p runs/<candidate_id>
@@ -37,12 +41,13 @@ the same schema. The scoring comparison is always between the two.
 
 **Primary score (the headline):**
 
-    primary_score = pnl_total × sharpe × (1 − max_drawdown)
+    primary_score = pnl_total × max(sharpe, 0) × (1 − max_drawdown)
 
 A winning model with high Sharpe and small drawdown produces a large
-positive score. A losing model with consistently-negative Sharpe produces
-a positive-but-small product (two negatives cancel) — disambiguate with
-Sharpe alone and PnL sign, which we always show alongside.
+positive score. `pnl_total` is the full run-total PnL, not a per-trade or
+per-event average. Negative Sharpe is floored at zero for scoring, so a
+net loser cannot receive a positive headline score from negative PnL times
+negative Sharpe.
 
 **Secondary (risk + consistency):**
 
@@ -130,11 +135,16 @@ available during the scoring window:
 
 ## Anti-exploitation checks
 
-The AST scanner is a screen, not a sandbox. For scoring we also:
+The AST scanner is a screen, not a sandbox. For scoring use
+`scripts/run_candidate.py`, which also applies best-effort process hardening
+before importing the candidate module. In addition:
 
-- Cap process memory via `ulimit -v 4194304` (~4 GB).
-- Run in a dedicated working directory; `MarketInfo.scratch_dir` is the
-  only filesystem path the model is told about.
+- Keep evaluator secrets out of the process environment. The runner scrubs
+  environment variables by default; use `--keep-env` only for local debugging.
+- Keep the default process limits unless intentionally debugging:
+  virtual memory 4 GB, max file size 1 GB, and max open files 256.
+- Run in a dedicated working directory; `MarketInfo.scratch_dir` is the only
+  filesystem path the model is told about.
 - After the run, grep the submitted file for any imports the scanner
   might have missed.
 - Review `report.json` — `n_trades == 0` with nonzero `pnl_total` is a

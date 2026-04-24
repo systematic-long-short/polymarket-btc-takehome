@@ -116,19 +116,39 @@ def test_summarize_keys_and_types() -> None:
     assert m["pnl_total"] == 20.0
     assert m["pnl_pct"] == pytest.approx(0.02)
     assert math.isfinite(m["sharpe"])
+    assert m["sharpe"] >= 0.0
     assert math.isfinite(m["sortino"])
     assert 0.0 <= m["max_drawdown"] <= 1.0
     assert m["n_events"] == 1
     assert m["hit_rate"] == 1.0
-    # Primary score: PnL × Sharpe × (1 − max_drawdown).
+    # Primary score: PnL × max(Sharpe, 0) × (1 − max_drawdown).
     expected = m["pnl_total"] * m["sharpe"] * max(0.0, 1.0 - m["max_drawdown"])
     assert m["primary_score"] == pytest.approx(expected)
 
 
-def test_primary_score_formula_is_pnl_times_sharpe_times_one_minus_mdd() -> None:
-    """Primary score = PnL × Sharpe × (1 − max_drawdown). With negative PnL
-    and (usually) negative Sharpe the product can be positive — but in the
-    ranking it's penalized by low magnitude and by the drawdown factor."""
+def test_primary_score_uses_full_run_pnl_not_event_ledger_sum() -> None:
+    """The PnL term is final_equity - starting_capital for the full run.
+
+    Event-level PnL rows are attribution/diagnostics. They should not become
+    a separate scoring source if they ever diverge from the canonical final
+    equity snapshot.
+    """
+    equity = [1000.0, 1005.0, 1015.0, 1020.0]
+    events = [_event(999.0, pnl_resolution=0.0, outcome="UP")]
+    m = summarize(
+        starting_capital=1000.0,
+        final_equity=1020.0,
+        equity_curve=equity,
+        events=events,
+    )
+    expected = 20.0 * m["sharpe"] * max(0.0, 1.0 - m["max_drawdown"])
+    assert m["pnl_total"] == pytest.approx(20.0)
+    assert m["primary_score"] == pytest.approx(expected)
+
+
+def test_summarize_floors_negative_sharpe_at_zero() -> None:
+    """A losing, consistently negative return stream should not earn a
+    positive primary score from negative PnL times negative Sharpe."""
     equity = [1000.0, 1005.0, 990.0, 980.0]
     events = [_event(-20.0, pnl_resolution=-15.0, outcome="DOWN")]
     m = summarize(
@@ -137,8 +157,9 @@ def test_primary_score_formula_is_pnl_times_sharpe_times_one_minus_mdd() -> None
         equity_curve=equity,
         events=events,
     )
-    expected = m["pnl_total"] * m["sharpe"] * max(0.0, 1.0 - m["max_drawdown"])
-    assert m["primary_score"] == pytest.approx(expected)
+    assert sharpe_ratio(tick_returns(equity)) < 0.0
+    assert m["sharpe"] == 0.0
+    assert m["primary_score"] == pytest.approx(0.0)
 
 
 def test_primary_score_penalises_drawdown() -> None:

@@ -61,9 +61,109 @@ def test_syntax_error_rejected() -> None:
     assert any(f.rule == "syntax_error" for f in report.findings)
 
 
-def test_open_for_write_is_warning_not_reject() -> None:
+def test_open_for_write_is_rejected() -> None:
     src = "f = open('/tmp/x', 'w')"
     report = scan_source(src)
-    # open for write is a warning, so verdict remains accept.
-    assert report.verdict == "accept"
-    assert any(f.rule == "open_for_write" for f in report.findings)
+    assert report.verdict == "reject"
+    assert any(f.rule == "blocked_call" for f in report.findings)
+
+
+def test_import_alias_does_not_bypass_blocked_os_call() -> None:
+    src = "import os as o\no.system('echo pwned')"
+    report = scan_source(src)
+    assert report.verdict == "reject"
+    rules = {f.rule for f in report.findings if f.severity == "critical"}
+    assert "blocked_import" in rules
+    assert "blocked_attr" in rules
+
+
+def test_from_import_alias_does_not_bypass_blocked_call() -> None:
+    src = "from os import system as run\nrun('echo pwned')"
+    report = scan_source(src)
+    assert report.verdict == "reject"
+    rules = {f.rule for f in report.findings if f.severity == "critical"}
+    assert "blocked_import" in rules
+    assert "blocked_call" in rules
+
+
+def test_pathlib_file_io_rejected() -> None:
+    src = "from pathlib import Path\nPath('/tmp/x').write_text('secret')"
+    report = scan_source(src)
+    assert report.verdict == "reject"
+    assert any(f.rule == "blocked_attr" for f in report.findings)
+
+
+def test_io_fileio_rejected() -> None:
+    report = scan_source("import io\nf = io.FileIO('/tmp/x', 'w')")
+    assert report.verdict == "reject"
+    assert any(f.rule in {"blocked_attr", "blocked_call"} for f in report.findings)
+
+
+def test_codecs_open_rejected() -> None:
+    report = scan_source("import codecs\nf = codecs.open('/tmp/x', 'w')")
+    assert report.verdict == "reject"
+    assert any(f.rule == "blocked_attr" for f in report.findings)
+
+
+def test_common_string_replace_is_allowed() -> None:
+    report = scan_source("x = 'BTC-USD'.replace('-', '')")
+    assert report.verdict == "accept", report.format_text()
+
+
+def test_environment_access_rejected() -> None:
+    report = scan_source("import os\nTOKEN = os.environ.get('TOKEN')")
+    assert report.verdict == "reject"
+    assert any(f.rule == "blocked_attr" for f in report.findings)
+
+
+def test_dynamic_getattr_rejected() -> None:
+    report = scan_source("fn = getattr(object, '__subclasses__')")
+    assert report.verdict == "reject"
+    assert any(f.rule == "blocked_call" for f in report.findings)
+
+
+def test_blocked_builtin_alias_rejected() -> None:
+    report = scan_source("fn = open\nfn('/tmp/x')")
+    assert report.verdict == "reject"
+    assert any(f.rule == "blocked_name" for f in report.findings)
+
+
+def test_operator_attrgetter_introspection_rejected() -> None:
+    report = scan_source("from operator import attrgetter\nfn = attrgetter('__subclasses__')")
+    assert report.verdict == "reject"
+    assert any(f.rule == "blocked_name" for f in report.findings)
+
+
+def test_operator_methodcaller_introspection_rejected() -> None:
+    report = scan_source("import operator\nfn = operator.methodcaller('__subclasses__')")
+    assert report.verdict == "reject"
+    assert any(f.rule in {'blocked_attr', 'blocked_name'} for f in report.findings)
+
+
+def test_dunder_introspection_rejected() -> None:
+    report = scan_source("x = (1).__class__.__mro__")
+    assert report.verdict == "reject"
+    assert any(f.rule == "blocked_attr" for f in report.findings)
+
+
+def test_polybench_internal_import_rejected() -> None:
+    report = scan_source("import polybench.harness")
+    assert report.verdict == "reject"
+    assert any(f.rule == "blocked_import" for f in report.findings)
+
+
+def test_polybench_from_import_internal_module_rejected() -> None:
+    report = scan_source("from polybench import harness")
+    assert report.verdict == "reject"
+    assert any(f.rule == "blocked_import" for f in report.findings)
+
+
+def test_polybench_from_import_public_api_allowed() -> None:
+    report = scan_source("from polybench import FLAT, Model, Signal, Side, Tick")
+    assert report.verdict == "accept", report.format_text()
+
+
+def test_polybench_module_mutation_rejected() -> None:
+    report = scan_source("import polybench\npolybench.Model = object")
+    assert report.verdict == "reject"
+    assert any(f.rule == "module_mutation" for f in report.findings)

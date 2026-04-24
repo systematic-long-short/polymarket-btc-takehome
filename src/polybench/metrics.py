@@ -118,15 +118,13 @@ def summarize(
     returns = tick_returns(equity_curve)
     pnl = final_equity - starting_capital
     pnl_pct = pnl / starting_capital if starting_capital else 0.0
-    sharpe = sharpe_ratio(returns, ticks_per_year=ticks_per_year)
+    raw_sharpe = sharpe_ratio(returns, ticks_per_year=ticks_per_year)
+    sharpe = max(0.0, raw_sharpe)
     mdd = max_drawdown(equity_curve)
-    # Primary score = PnL × Sharpe × (1 − max_drawdown).
-    # A winning model with high Sharpe and low drawdown scores very high.
-    # A losing model with consistently-negative Sharpe will produce a positive
-    # product (two negatives cancel) but of small magnitude relative to a
-    # winner — the drawdown term is the penalty that keeps noisy wins from
-    # dominating clean ones.
-    primary_score = pnl * sharpe * max(0.0, 1.0 - mdd)
+    # Primary score = PnL × max(raw Sharpe, 0) × (1 − max_drawdown).
+    # Flooring Sharpe prevents net-losing, consistently negative tracks from
+    # receiving a positive score via negative PnL × negative Sharpe.
+    primary_score = 0.0 if sharpe == 0.0 else pnl * sharpe * max(0.0, 1.0 - mdd)
     intra = sum(e.pnl_intra_event for e in events)
     reso = sum(e.pnl_resolution for e in events)
     denom = abs(intra) + abs(reso)
@@ -148,5 +146,5 @@ def summarize(
         "pnl_intra_event": intra,
         "pnl_resolution": reso,
         "intra_vs_resolution_fraction": intra_fraction,  # 1 = all intra, -1 = all resolution
-        "primary_score": primary_score,                  # PnL × Sharpe × (1 − max_drawdown)
+        "primary_score": primary_score,                  # PnL × max(Sharpe, 0) × (1 − max_drawdown)
     }

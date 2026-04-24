@@ -35,7 +35,10 @@ def _load_model_from_spec(spec: str, config: dict[str, Any] | None) -> Model:
     klass = getattr(module, class_name, None)
     if klass is None:
         raise SystemExit(f"class {class_name!r} not found in {module_name!r}")
-    return klass(config=config)
+    model = klass(config=config)
+    if not isinstance(model, Model):
+        raise SystemExit(f"{class_name!r} must subclass polybench.Model")
+    return model
 
 
 def _load_model_from_file(
@@ -54,7 +57,10 @@ def _load_model_from_file(
     klass = getattr(module, class_name, None)
     if klass is None:
         raise SystemExit(f"class {class_name!r} not found in {path}")
-    return klass(config=config)
+    model = klass(config=config)
+    if not isinstance(model, Model):
+        raise SystemExit(f"{class_name!r} must subclass polybench.Model")
+    return model
 
 
 def _load_config(path: str | None) -> dict[str, Any] | None:
@@ -154,8 +160,9 @@ def build_parser() -> argparse.ArgumentParser:
                    help="Polymarket-style fee coefficient (0.072 = ~1.8%% at p=0.5)")
     r.add_argument(
         "--price-source",
-        choices=["binance", "binance-us", "coinbase"],
-        default="binance",
+        choices=["polymarket", "binance", "binance-us", "coinbase"],
+        default="polymarket",
+        help="Default 'polymarket' disables external BTC WebSockets.",
     )
     r.add_argument("--output-dir", default="runs/latest")
     r.set_defaults(func=_cmd_run)

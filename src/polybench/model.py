@@ -45,7 +45,7 @@ class Tick:
     ts: float                      # unix seconds, tick dispatch time
     time_to_resolve: float         # seconds remaining until event end_date_ts
 
-    btc_last: float                # last BTC trade (from price feed)
+    btc_last: float                # optional BTC spot feed; 0 in Polymarket-only mode
     btc_bid: float
     btc_ask: float
 

@@ -1,11 +1,12 @@
-"""BTC price feed — Binance (default), Binance.US, or Coinbase.
+"""Optional BTC price feed — disabled by default, or Binance/Binance.US/Coinbase.
 
 Subscribes to WebSocket channels that give us:
   - last trade price  (Binance: ``btcusdt@trade``; Coinbase: ``ticker``)
   - top-of-book bid/ask (Binance: ``btcusdt@bookTicker``; derived on Coinbase)
 
-Exposes a lock-free-ish snapshot for the tick loop plus a rolling window of
-recent last-trade prices (default 300 samples = 5 min at 1 Hz).
+The live harness's official trading data comes from Polymarket. BTC spot is an
+optional auxiliary feature; in the default ``polymarket`` mode this feed is
+disabled and snapshots return zero BTC fields.
 
 Auto-failover: if the active source fails to connect or goes silent for >30s,
 advance to the next source in the fallback chain.
@@ -24,7 +25,6 @@ from dataclasses import dataclass, field
 from typing import Iterable
 
 import websockets
-from websockets.exceptions import WebSocketException
 
 log = logging.getLogger("polybench.pricefeed")
 
@@ -33,7 +33,8 @@ BINANCE_GLOBAL_URL = "wss://stream.binance.com:9443/ws"
 BINANCE_US_URL = "wss://stream.binance.us:9443/ws"
 COINBASE_URL = "wss://ws-feed.exchange.coinbase.com"
 
-VALID_SOURCES = ("binance", "binance-us", "coinbase")
+POLYMARKET_ONLY_SOURCE = "polymarket"
+VALID_SOURCES = (POLYMARKET_ONLY_SOURCE, "binance", "binance-us", "coinbase")
 FALLBACK_CHAIN: dict[str, tuple[str, ...]] = {
     "binance": ("binance-us", "coinbase"),
     "binance-us": ("binance", "coinbase"),
@@ -53,7 +54,7 @@ class PriceSnapshot:
 
 
 class PriceFeed:
-    """Asynchronous BTC/USD price feed with auto-reconnect + source failover."""
+    """Optional asynchronous BTC/USD price feed with auto-reconnect + failover."""
 
     def __init__(
         self,
@@ -82,6 +83,10 @@ class PriceFeed:
         return self._active_source
 
     async def start(self) -> None:
+        if self._preferred == POLYMARKET_ONLY_SOURCE:
+            self._active_source = POLYMARKET_ONLY_SOURCE
+            self._ready.set()
+            return
         if self._task is not None and not self._task.done():
             return
         self._stop.clear()
@@ -89,6 +94,10 @@ class PriceFeed:
         self._task = asyncio.create_task(self._run(), name="polybench-pricefeed")
 
     async def stop(self) -> None:
+        if self._preferred == POLYMARKET_ONLY_SOURCE:
+            self._stop.set()
+            self._task = None
+            return
         self._stop.set()
         if self._task is not None:
             with contextlib.suppress(asyncio.CancelledError):
@@ -116,6 +125,8 @@ class PriceFeed:
     # ----- internal -----
 
     def _sources_to_try(self) -> Iterable[str]:
+        if self._preferred == POLYMARKET_ONLY_SOURCE:
+            return
         yield self._preferred
         for fallback in FALLBACK_CHAIN[self._preferred]:
             yield fallback
@@ -177,7 +188,7 @@ class PriceFeed:
             close_timeout=5,
             max_size=2**20,
         ) as ws:
-            silence_task = asyncio.create_task(self._silence_watchdog())
+            silence_task = asyncio.create_task(self._silence_watchdog(ws))
             try:
                 async for raw in ws:
                     if self._stop.is_set():
@@ -207,7 +218,7 @@ class PriceFeed:
                 "channels": ["ticker"],
             }
             await ws.send(json.dumps(subscribe))
-            silence_task = asyncio.create_task(self._silence_watchdog())
+            silence_task = asyncio.create_task(self._silence_watchdog(ws))
             try:
                 async for raw in ws:
                     if self._stop.is_set():
@@ -222,8 +233,8 @@ class PriceFeed:
                 with contextlib.suppress(asyncio.CancelledError):
                     await silence_task
 
-    async def _silence_watchdog(self) -> None:
-        """Cancel the socket if no messages arrive for >SILENCE_FAILOVER_SECONDS."""
+    async def _silence_watchdog(self, ws) -> None:
+        """Close the socket if no messages arrive for >SILENCE_FAILOVER_SECONDS."""
         while not self._stop.is_set():
             await asyncio.sleep(5.0)
             if self._last_msg_ts == 0.0:
@@ -235,8 +246,9 @@ class PriceFeed:
                     silence,
                     self._active_source,
                 )
-                # Raising forces _stream_from to bail; outer loop retries/rotates.
-                raise TimeoutError(f"silence {silence:.1f}s")
+                with contextlib.suppress(Exception):
+                    await ws.close(code=1011, reason=f"silence {silence:.1f}s")
+                return
 
     def _handle_binance_msg(self, msg: dict) -> None:
         # btcusdt@trade events

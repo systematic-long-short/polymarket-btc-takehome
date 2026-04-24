@@ -94,6 +94,21 @@ def test_parse_book_empty_sides() -> None:
     assert book.best_ask == 0.0
 
 
+def test_parse_book_accepts_documented_snake_case_summary_fields() -> None:
+    payload = {
+        "bids": [],
+        "asks": [],
+        "best_bid": "0.40",
+        "best_ask": "0.42",
+        "last_trade_price": "0.41",
+    }
+    book = _parse_book("tok", payload, ts=0.0)
+    assert book.best_bid == 0.40
+    assert book.best_ask == 0.42
+    assert book.last_trade == 0.41
+    assert book.mid == pytest.approx(0.41)
+
+
 # ---- async client with mock transport ----
 
 GAMMA_EVENT_RESPONSE = [

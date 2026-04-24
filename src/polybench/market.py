@@ -105,9 +105,13 @@ def _parse_book(token_id: str, payload: dict[str, Any], ts: float) -> Book:
     # CLOB sorts bids descending, asks ascending. Be defensive.
     bids = tuple(sorted(bids, key=lambda l: -l.price))
     asks = tuple(sorted(asks, key=lambda l: l.price))
-    best_bid = bids[0].price if bids else _parse_float(payload.get("bestBid"))
-    best_ask = asks[0].price if asks else _parse_float(payload.get("bestAsk"))
-    last_trade = _parse_float(payload.get("lastTradePrice"))
+    best_bid = bids[0].price if bids else _parse_float(
+        payload.get("bestBid", payload.get("best_bid"))
+    )
+    best_ask = asks[0].price if asks else _parse_float(
+        payload.get("bestAsk", payload.get("best_ask"))
+    )
+    last_trade = _parse_float(payload.get("lastTradePrice", payload.get("last_trade_price")))
     return Book(
         token_id=token_id,
         bids=bids,

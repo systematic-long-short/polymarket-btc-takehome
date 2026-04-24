@@ -9,9 +9,9 @@ and runs the submission inside a dedicated working directory.
 Policy:
   - Blocked imports (hard reject)                — see ``BLOCKED_MODULES``
   - Only allowlisted imports permitted          — see ``ALLOWED_MODULES``
-  - Blocked call targets (hard reject)          — eval/exec/compile/__import__/breakpoint
-  - Blocked attribute paths (hard reject)       — os.system, os.popen, os.execve, etc.
-  - Suspicious open() for writing outside scratch — warning
+  - Blocked call targets (hard reject)          — eval/exec/compile/__import__/open/etc.
+  - Blocked attribute paths (hard reject)       — os.system, Path.write_text, os.environ, etc.
+  - Blocked module monkey-patching              — assignments to imported module attributes
 """
 
 from __future__ import annotations
@@ -66,9 +66,6 @@ STDLIB_ALLOWED: frozenset[str] = frozenset({
     "base64", "gzip", "zlib", "bz2", "lzma",
     "threading", "queue", "asyncio", "concurrent",
     "warnings", "traceback",
-    "os",            # allowed but dangerous attrs blocked (see below)
-    "sys",           # allowed but some attrs blocked
-    "inspect",
     "struct",
     "unicodedata",
     "__future__",
@@ -94,10 +91,13 @@ BLOCKED_MODULES: frozenset[str] = frozenset({
     "dill",
     "cloudpickle",
     "importlib",
+    "inspect",
+    "os",
     "resource",
     "fcntl",
     "signal",
     "shutil",
+    "sys",
 })
 
 BLOCKED_CALL_NAMES: frozenset[str] = frozenset({
@@ -106,12 +106,17 @@ BLOCKED_CALL_NAMES: frozenset[str] = frozenset({
     "compile",
     "__import__",
     "breakpoint",
+    "open",
+    "input",
+    "getattr",
+    "setattr",
+    "delattr",
     "globals",
     "locals",
     "vars",
 })
 
-# attribute-path blocks: os.system(...), os.popen(...), etc.
+# attribute-path blocks: os.system(...), os.popen(...), Path.write_text(...), etc.
 BLOCKED_ATTR_PATHS: frozenset[str] = frozenset({
     "os.system",
     "os.popen",
@@ -135,8 +140,149 @@ BLOCKED_ATTR_PATHS: frozenset[str] = frozenset({
     "os.remove",
     "os.rmdir",
     "os.removedirs",
+    "os.rename",
+    "os.replace",
+    "os.renames",
+    "os.mkdir",
+    "os.makedirs",
+    "os.chmod",
+    "os.chown",
+    "os.getenv",
+    "os.putenv",
+    "os.unsetenv",
+    "os.environ",
     "sys.exit",          # not dangerous but disruptive to the harness loop
     "sys.modules",
+    "pathlib.Path.open",
+    "pathlib.Path.read_text",
+    "pathlib.Path.read_bytes",
+    "pathlib.Path.write_text",
+    "pathlib.Path.write_bytes",
+    "pathlib.Path.unlink",
+    "pathlib.Path.rmdir",
+    "pathlib.Path.rename",
+    "pathlib.Path.replace",
+    "pathlib.Path.mkdir",
+    "pathlib.Path.touch",
+    "pathlib.Path.chmod",
+    "pathlib.Path.owner",
+    "pathlib.Path.group",
+    "pathlib.Path.home",
+    "pathlib.Path.cwd",
+    "pathlib.Path.resolve",
+    "pathlib.Path.absolute",
+    "bz2.open",
+    "codecs.open",
+    "gzip.open",
+    "io.FileIO",
+    "io.open",
+    "lzma.open",
+    "numpy.load",
+    "numpy.memmap",
+    "numpy.save",
+    "numpy.savez",
+    "numpy.savetxt",
+    "operator.attrgetter",
+    "operator.methodcaller",
+    "pandas.read_csv",
+    "pandas.read_json",
+    "pandas.read_parquet",
+    "pandas.read_pickle",
+    "pandas.read_feather",
+    "pandas.read_sql",
+    "polars.read_csv",
+    "polars.read_json",
+    "polars.read_parquet",
+    "polars.read_database",
+    "polars.scan_csv",
+    "polars.scan_parquet",
+})
+
+BLOCKED_ATTR_NAMES: frozenset[str] = frozenset({
+    # Filesystem methods on pathlib objects and file-like helpers. The scanner
+    # cannot prove a path stays under MarketInfo.scratch_dir, so direct file IO
+    # is rejected for submitted models.
+    "open",
+    "read_text",
+    "read_bytes",
+    "write_text",
+    "write_bytes",
+    "unlink",
+    "rmdir",
+    "mkdir",
+    "touch",
+    "chmod",
+    "chown",
+    "owner",
+    "group",
+    "home",
+    "cwd",
+    "resolve",
+    "absolute",
+    "expanduser",
+    # Data-library file IO helpers.
+    "to_csv",
+    "to_json",
+    "to_parquet",
+    "to_pickle",
+    "to_feather",
+    "to_sql",
+})
+
+BLOCKED_DUNDER_ATTRS: frozenset[str] = frozenset({
+    "__bases__",
+    "__base__",
+    "__builtins__",
+    "__class__",
+    "__closure__",
+    "__code__",
+    "__dict__",
+    "__globals__",
+    "__getattribute__",
+    "__mro__",
+    "__reduce__",
+    "__reduce_ex__",
+    "__setattr__",
+    "__subclasses__",
+})
+
+BLOCKED_NAMES: frozenset[str] = frozenset({
+    "__builtins__",
+})
+
+PROTECTED_MODULE_ROOTS: frozenset[str] = frozenset({
+    "polybench",
+    "httpx",
+    "websockets",
+    "numpy",
+    "pandas",
+    "polars",
+    "scipy",
+    "statsmodels",
+    "sklearn",
+    "lightgbm",
+    "xgboost",
+    "optuna",
+    "torch",
+    "tensorflow",
+    "ta",
+})
+
+POLYBENCH_ALLOWED_IMPORTS: frozenset[str] = frozenset({
+    "polybench",
+    "polybench.model",
+    "polybench.baselines",
+})
+
+POLYBENCH_ROOT_ALLOWED_NAMES: frozenset[str] = frozenset({
+    "FLAT",
+    "EventResult",
+    "MarketInfo",
+    "Model",
+    "RunResult",
+    "Side",
+    "Signal",
+    "Tick",
 })
 
 
@@ -202,17 +348,41 @@ class _Visitor(ast.NodeVisitor):
     def __init__(self) -> None:
         self.findings: list[Finding] = []
         self.imports: list[str] = []
+        self.aliases: dict[str, str] = {}
 
     # -- imports --
     def visit_Import(self, node: ast.Import) -> None:
         for alias in node.names:
             self._check_module(alias.name, node)
+            local_name = alias.asname or alias.name.split(".", 1)[0]
+            self.aliases[local_name] = alias.name
         self.generic_visit(node)
 
     def visit_ImportFrom(self, node: ast.ImportFrom) -> None:
         mod = node.module or ""
         if mod:
             self._check_module(mod, node)
+        for alias in node.names:
+            if alias.name == "*":
+                self._add(
+                    node,
+                    severity="critical",
+                    rule="star_import",
+                    message="star imports are not allowed in submissions",
+                )
+                continue
+            if mod == "polybench" and alias.name not in POLYBENCH_ROOT_ALLOWED_NAMES:
+                self._add(
+                    node,
+                    severity="critical",
+                    rule="blocked_import",
+                    message=(
+                        f"from polybench import {alias.name!r} is not allowed — "
+                        "import only the public model API names"
+                    ),
+                )
+            local_name = alias.asname or alias.name
+            self.aliases[local_name] = f"{mod}.{alias.name}" if mod else alias.name
         self.generic_visit(node)
 
     def _check_module(self, name: str, node: ast.AST) -> None:
@@ -224,6 +394,17 @@ class _Visitor(ast.NodeVisitor):
                 severity="critical",
                 rule="blocked_import",
                 message=f"import of blocked module {name!r}",
+            )
+            return
+        if root == "polybench" and name not in POLYBENCH_ALLOWED_IMPORTS:
+            self._add(
+                node,
+                severity="critical",
+                rule="blocked_import",
+                message=(
+                    f"import of {name!r} — submissions may import only "
+                    "polybench's public model API"
+                ),
             )
             return
         if root not in ALLOWED_MODULES:
@@ -241,6 +422,7 @@ class _Visitor(ast.NodeVisitor):
     def visit_Call(self, node: ast.Call) -> None:
         func = node.func
         if isinstance(func, ast.Name):
+            normalized_name = self._normalize_path(func.id)
             if func.id in BLOCKED_CALL_NAMES:
                 self._add(
                     node,
@@ -248,13 +430,19 @@ class _Visitor(ast.NodeVisitor):
                     rule="blocked_call",
                     message=f"call to blocked builtin {func.id!r}",
                 )
-            elif func.id == "open":
-                self._check_open_call(node)
+            elif normalized_name in BLOCKED_ATTR_PATHS:
+                self._add(
+                    node,
+                    severity="critical",
+                    rule="blocked_call",
+                    message=f"call to blocked target {normalized_name}",
+                )
         # Attribute-path violations are handled in visit_Attribute (once).
         self.generic_visit(node)
 
     def visit_Attribute(self, node: ast.Attribute) -> None:
-        path = _attr_path(node)
+        raw_path = _attr_path(node)
+        path = self._normalize_path(raw_path) if raw_path is not None else None
         if path is not None and path in BLOCKED_ATTR_PATHS:
             self._add(
                 node,
@@ -262,27 +450,92 @@ class _Visitor(ast.NodeVisitor):
                 rule="blocked_attr",
                 message=f"reference to blocked attribute {path}",
             )
-        self.generic_visit(node)
-
-    def _check_open_call(self, node: ast.Call) -> None:
-        mode: str | None = None
-        if len(node.args) >= 2 and isinstance(node.args[1], ast.Constant):
-            mode = node.args[1].value if isinstance(node.args[1].value, str) else None
-        for kw in node.keywords:
-            if kw.arg == "mode" and isinstance(kw.value, ast.Constant):
-                mode = kw.value.value if isinstance(kw.value.value, str) else mode
-        if mode is None:
-            return
-        if any(m in mode for m in ("w", "a", "x", "+")):
+        elif node.attr in BLOCKED_ATTR_NAMES:
             self._add(
                 node,
-                severity="warning",
-                rule="open_for_write",
-                message=(
-                    f"open() with write mode {mode!r} — writes must stay inside "
-                    "MarketInfo.scratch_dir or a tempfile.NamedTemporaryFile path"
-                ),
+                severity="critical",
+                rule="blocked_attr",
+                message=f"reference to blocked attribute {node.attr}",
             )
+        elif node.attr in BLOCKED_DUNDER_ATTRS:
+            self._add(
+                node,
+                severity="critical",
+                rule="blocked_attr",
+                message=f"reference to blocked introspection attribute {node.attr}",
+            )
+        self.generic_visit(node)
+
+    def visit_Name(self, node: ast.Name) -> None:
+        if node.id in BLOCKED_NAMES:
+            self._add(
+                node,
+                severity="critical",
+                rule="blocked_name",
+                message=f"reference to blocked name {node.id}",
+            )
+        if isinstance(node.ctx, ast.Load):
+            normalized_name = self._normalize_path(node.id)
+            if node.id in BLOCKED_CALL_NAMES:
+                self._add(
+                    node,
+                    severity="critical",
+                    rule="blocked_name",
+                    message=f"reference to blocked builtin {node.id!r}",
+                )
+            elif normalized_name in BLOCKED_ATTR_PATHS:
+                self._add(
+                    node,
+                    severity="critical",
+                    rule="blocked_name",
+                    message=f"reference to blocked target {normalized_name}",
+                )
+        self.generic_visit(node)
+
+    def visit_Assign(self, node: ast.Assign) -> None:
+        self._check_assignment_targets(node.targets)
+        self.generic_visit(node)
+
+    def visit_AnnAssign(self, node: ast.AnnAssign) -> None:
+        self._check_assignment_targets([node.target])
+        self.generic_visit(node)
+
+    def visit_AugAssign(self, node: ast.AugAssign) -> None:
+        self._check_assignment_targets([node.target])
+        self.generic_visit(node)
+
+    def visit_Delete(self, node: ast.Delete) -> None:
+        self._check_assignment_targets(node.targets, action="delete")
+        self.generic_visit(node)
+
+    def _check_assignment_targets(
+        self, targets: Iterable[ast.expr], *, action: str = "assignment"
+    ) -> None:
+        for target in targets:
+            if isinstance(target, (ast.Tuple, ast.List)):
+                self._check_assignment_targets(target.elts, action=action)
+                continue
+            if not isinstance(target, ast.Attribute):
+                continue
+            raw_path = _attr_path(target)
+            if raw_path is None:
+                continue
+            path = self._normalize_path(raw_path)
+            root = path.split(".", 1)[0]
+            if root in PROTECTED_MODULE_ROOTS:
+                self._add(
+                    target,
+                    severity="critical",
+                    rule="module_mutation",
+                    message=f"{action} to imported module attribute {path}",
+                )
+
+    def _normalize_path(self, path: str) -> str:
+        head, sep, rest = path.partition(".")
+        mapped = self.aliases.get(head)
+        if mapped is None:
+            return path
+        return f"{mapped}{sep}{rest}" if sep else mapped
 
     # -- helpers --
     def _add(self, node: ast.AST, *, severity: str, rule: str, message: str) -> None:

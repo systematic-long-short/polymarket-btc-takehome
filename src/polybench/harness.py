@@ -3,7 +3,7 @@ Polymarket 5-minute BTC up/down events.
 
 Architecture (single asyncio event loop):
 
-    pricefeed task    — Binance/Coinbase WS, exposes snapshot()
+    pricefeed task    — optional BTC feed; disabled in default Polymarket-only mode
     clob_poller task  — 1 Hz REST poll of UP+DOWN order books, cached
     event_watcher     — called from main loop: find next event when idle, detect resolution
     tick_loop (main)  — 1 Hz, assembles Tick, calls on_tick (500 ms budget),
@@ -21,6 +21,7 @@ import contextlib
 import dataclasses
 import json
 import logging
+import math
 import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
@@ -55,7 +56,7 @@ class HarnessConfig:
     starting_capital: float = 1000.0
     slippage_bps: float = 200.0
     fee_rate: float = 0.072   # Polymarket-style per-trade fee coefficient
-    price_source: str = "binance"
+    price_source: str = "polymarket"
     price_window_size: int = 300
     output_dir: Path = Path("runs/latest")
     series_slug: str = "btc-up-or-down-5m"
@@ -617,9 +618,15 @@ class Harness:
             log.warning("model.on_tick returned %s, expected Signal", type(result).__name__)
             return None
         # Normalize: clip size into [0,1], clamp side to enum.
-        side = result.side if isinstance(result.side, Side) else Side(str(result.side))
-        size = max(0.0, min(1.0, float(result.size)))
-        conf = max(0.0, min(1.0, float(result.confidence)))
+        try:
+            side = result.side if isinstance(result.side, Side) else Side(str(result.side))
+            size_raw = float(result.size)
+            conf_raw = float(result.confidence)
+        except (TypeError, ValueError):
+            log.warning("model.on_tick returned an invalid Signal: %r", result)
+            return None
+        size = max(0.0, min(1.0, size_raw)) if math.isfinite(size_raw) else 0.0
+        conf = max(0.0, min(1.0, conf_raw)) if math.isfinite(conf_raw) else 0.0
         return Signal(side=side, size=size, confidence=conf)
 
     # ---- run result ----
@@ -770,7 +777,7 @@ async def run_model(
     output_dir: Path | str = "runs/latest",
     starting_capital: float = 1000.0,
     slippage_bps: float = 200.0,
-    price_source: str = "binance",
+    price_source: str = "polymarket",
     tick_interval_s: float = DEFAULT_TICK_INTERVAL_S,
     model_budget_s: float = DEFAULT_MODEL_BUDGET_S,
     on_summary: Callable[[str], None] | None = None,

@@ -34,8 +34,9 @@ def main(argv: list[str] | None = None) -> int:
         default="tests/fixtures/recorded_event.parquet",
         help="destination parquet path",
     )
-    p.add_argument("--price-source", default="binance",
-                   choices=["binance", "binance-us", "coinbase"])
+    p.add_argument("--price-source", default="polymarket",
+                   choices=["polymarket", "binance", "binance-us", "coinbase"],
+                   help="Default 'polymarket' records Polymarket only.")
     args = p.parse_args(argv)
 
     run_dir = Path(f"runs/record_fixture_tmp")

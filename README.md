@@ -72,9 +72,9 @@ class Tick:
     ts: float                  # unix seconds
     time_to_resolve: float     # seconds until event endDate
 
-    btc_last: float            # last Binance/Coinbase BTC trade
-    btc_bid: float
-    btc_ask: float
+    btc_last: float            # optional BTC spot feed; 0 in default Polymarket-only live runs
+    btc_bid: float             # optional BTC bid; 0 in default Polymarket-only live runs
+    btc_ask: float             # optional BTC ask; 0 in default Polymarket-only live runs
 
     up_bid: float              # Polymarket UP token best bid (in $0–$1)
     up_ask: float
@@ -83,7 +83,7 @@ class Tick:
     down_ask: float
     down_mid: float
 
-    btc_recent: tuple[float, ...]      # rolling window of BTC lasts
+    btc_recent: tuple[float, ...]      # rolling BTC window; empty in default Polymarket-only runs
     up_mid_recent: tuple[float, ...]   # rolling window of UP mids
     event_id: str
 ```
@@ -129,11 +129,14 @@ Your submission may import only:
 * **Python standard library** — the usual safe subset (`math`, `statistics`,
   `collections`, `itertools`, `functools`, `datetime`, `json`, `re`,
   `random`, `threading`, `queue`, `asyncio`, `pathlib`, `logging`, etc.).
+  Direct filesystem, environment, subprocess, dynamic import, and
+  introspection APIs are rejected by the scanner even if their modules are
+  otherwise part of Python.
 * **Data & numerical:** `numpy`, `pandas`, `polars`, `scipy`, `statsmodels`
 * **Classical ML:** `scikit-learn`, `lightgbm`, `xgboost`, `optuna`
 * **Deep learning (CPU):** `torch`, `tensorflow`
 * **Technical indicators:** `ta`
-* **Harness internals you can touch:** `polybench`, `httpx`, `websockets`
+* **Harness APIs you can import:** `polybench`, `httpx`, `websockets`
 
 If you need a library that's not on this list, **ask before submitting**.
 An unknown import is treated as a failed submission — the security
@@ -153,9 +156,11 @@ scanner rejects it statically.
   500 ms budget. For slow external feeds, start a background thread in
   `on_start` and read cached state from `on_tick` — see the template for
   the pattern.
-- **No filesystem writes outside `market_info.scratch_dir`.** No
-  subprocesses. No reading forward-looking data (the resolution price is
-  not exposed — don't go looking for it in Gamma either).
+- **No direct filesystem or environment access.** The evaluator passes your
+  optional `config.json` through `self.config`; do not read files or
+  environment variables from the submission. No subprocesses. No reading
+  forward-looking data (the resolution price is not exposed — don't go
+  looking for it in Gamma either).
 - **No peeking at the resolution.** Obvious, but stated. The parquet
   recorder logs every tick's inputs, so we can verify post-hoc that your
   signal at time T didn't depend on data from T+1 or the settled outcome.
@@ -164,10 +169,11 @@ scanner rejects it statically.
 
 ## How scoring works
 
-**Primary score:** `PnL × Sharpe × (1 − max_drawdown)`. Bigger is better.
+**Primary score:** `PnL × max(Sharpe, 0) × (1 − max_drawdown)`. Bigger is better.
 
-- `PnL` is total dollars made over the run (final equity minus starting capital).
-- `Sharpe` is annualized on tick-level returns. Consistency matters.
+- `PnL` is total dollars made over the full run (final equity minus starting capital).
+- `Sharpe` is annualized on tick-level returns and floored at zero for
+  scoring. Consistency matters, but negative consistency does not help.
 - `max_drawdown` is the worst peak-to-trough drawdown seen during the run,
   as a fraction in `[0, 1]`. The `(1 − max_drawdown)` multiplier penalizes
   volatile wins: a strategy that earns $100 cleanly beats one that earns
@@ -229,6 +235,12 @@ python scripts/run_baseline.py --duration 300
 # call (you ran the baseline as your "model") — that's by design.
 ```
 
+The official live path is **Polymarket-only by default**. It discovers the
+active BTC 5-minute event from Gamma and polls Polymarket order books; it does
+not require Binance/Coinbase WebSockets. Evaluators can opt into an auxiliary
+BTC feed with `--price-source binance`, `binance-us`, or `coinbase`, but that
+is not required for scoring.
+
 ---
 
 ## Working offline (replay mode)
@@ -247,10 +259,9 @@ The fixture is schema-compatible with live recordings — the same
 `on_tick` gets called with the same `Tick` shape, so anything that works
 in replay will work live.
 
-The committed fixture is built from **real Binance BTC price data**
-captured over 10 minutes, with realistic synthesized Polymarket token
-prices that respond to BTC momentum. It exercises both UP-winning and
-DOWN-winning resolutions.
+The committed fixture is an offline regression aid with realistic synthesized
+Polymarket token prices. It exercises both UP-winning and DOWN-winning
+resolutions, but it is not scoring evidence.
 
 To record your own fresh fixture from live data:
 
@@ -303,8 +314,10 @@ applies to `on_tick` return.
 A: Clamped. Negative sizes are treated as zero.
 
 **Q: Does my position carry between events?**
-A: Yes. The harness does not auto-flatten between events. If you want to
-be flat at event end, emit a `FLAT` signal when `tick.time_to_resolve`
+A: No. Event tokens are not fungible across consecutive 5-minute markets.
+Any shares still held at event end are settled against that event's final
+`outcomePrices`, then the simulator starts the next event flat. If you
+want to avoid resolution exposure, emit `FLAT` when `tick.time_to_resolve`
 drops near zero.
 
 **Q: I want to use a library that's not on the list.**
@@ -330,13 +343,13 @@ polymarket-btc-takehome/
 │   ├── model.py                  ← Model ABC + dataclasses
 │   ├── harness.py                ← async event loop, event rollover
 │   ├── market.py                 ← Gamma + CLOB client
-│   ├── pricefeed.py              ← Binance / Coinbase WS feed
+│   ├── pricefeed.py              ← optional BTC WS feed; off by default
 │   ├── pnl.py                    ← paper-trade simulator
 │   ├── metrics.py                ← Sharpe / Sortino / DD / hit rate
 │   ├── recorder.py               ← parquet tick log
 │   ├── replay.py                 ← offline replay engine
 │   ├── submission_scan.py        ← AST security screener
-│   ├── baselines.py              ← the three reference baselines
+│   ├── baselines.py              ← reference MomentumBaseline
 │   └── cli.py                    ← polybench run|replay|scan
 ├── models/baseline_models.py     ← re-export of polybench.baselines
 ├── examples/model_submission.py  ← candidate template

@@ -81,9 +81,20 @@ def replay(
         except Exception:  # noqa: BLE001
             log.exception("%s.on_tick raised during replay", type(m).__name__)
             return None
-        if sig is not None and not isinstance(sig, Signal):
+        if sig is None:
             return None
-        return sig
+        if not isinstance(sig, Signal):
+            return None
+        try:
+            side = sig.side if isinstance(sig.side, Side) else Side(str(sig.side))
+            size_raw = float(sig.size)
+            conf_raw = float(sig.confidence)
+        except (TypeError, ValueError):
+            log.warning("%s.on_tick returned an invalid Signal during replay: %r", type(m).__name__, sig)
+            return None
+        size = max(0.0, min(1.0, size_raw)) if math.isfinite(size_raw) else 0.0
+        conf = max(0.0, min(1.0, conf_raw)) if math.isfinite(conf_raw) else 0.0
+        return Signal(side=side, size=size, confidence=conf)
 
     for row in df.itertuples(index=False):
         event_id = str(getattr(row, "event_id", "") or "")

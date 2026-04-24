@@ -91,5 +91,5 @@ class ModelSubmission(Model):
 
     def on_finish(self, result: RunResult) -> None:
         # Called once at the end of the whole run. Use for teardown/logging.
-        # TODO: (optional) print summary, stop background threads, save state.
+        # TODO: (optional) print summary or stop background threads.
         pass

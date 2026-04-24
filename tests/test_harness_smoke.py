@@ -11,6 +11,7 @@ from pathlib import Path
 
 from polybench import FLAT, Model, Side, Signal, Tick
 from polybench.baselines import MomentumBaseline
+from polybench.harness import Harness, HarnessConfig
 from polybench.replay import ReplayConfig, replay
 
 
@@ -34,6 +35,27 @@ class _AlwaysUpModel(Model):
 class _FlatModel(Model):
     def on_tick(self, tick: Tick) -> Signal | None:
         return FLAT
+
+
+class _InvalidSignalModel(Model):
+    def on_tick(self, tick: Tick) -> Signal | None:
+        return Signal(side="BAD", size="not-a-number")  # type: ignore[arg-type]
+
+
+def _tick() -> Tick:
+    return Tick(
+        ts=1.0,
+        time_to_resolve=10.0,
+        btc_last=100.0,
+        btc_bid=99.0,
+        btc_ask=101.0,
+        up_bid=0.49,
+        up_ask=0.51,
+        up_mid=0.50,
+        down_bid=0.49,
+        down_ask=0.51,
+        down_mid=0.50,
+    )
 
 
 def test_replay_flat_model_zero_pnl(any_event_fixture: Path, tmp_path: Path) -> None:
@@ -68,6 +90,29 @@ def test_replay_momentum_baseline_runs(
     assert result.metrics["n_events"] >= 1
 
 
+def test_momentum_baseline_uses_up_mid_when_btc_unavailable() -> None:
+    model = MomentumBaseline(config={"lookback_s": 2, "pm_threshold": 0.01})
+    tick = Tick(
+        ts=1.0,
+        time_to_resolve=100.0,
+        btc_last=0.0,
+        btc_bid=0.0,
+        btc_ask=0.0,
+        up_bid=0.52,
+        up_ask=0.54,
+        up_mid=0.53,
+        down_bid=0.46,
+        down_ask=0.48,
+        down_mid=0.47,
+        btc_recent=(),
+        up_mid_recent=(0.50, 0.51, 0.53),
+    )
+    signal = model.on_tick(tick)
+    assert signal is not None
+    assert signal.side == Side.UP
+    assert signal.size > 0.0
+
+
 def test_replay_writes_dual_column_report_json(
     any_event_fixture: Path, tmp_path: Path
 ) -> None:
@@ -82,3 +127,11 @@ def test_replay_writes_dual_column_report_json(
     assert "baseline" in payload
     assert "metrics" in payload["model"]
     assert "metrics" in payload["baseline"]
+
+
+def test_live_harness_drops_invalid_signal(tmp_path: Path) -> None:
+    harness = Harness(_InvalidSignalModel(), HarnessConfig(output_dir=tmp_path / "out"))
+    try:
+        assert harness._safe_on_tick(_InvalidSignalModel(), _tick()) is None
+    finally:
+        harness._executor.shutdown(wait=False, cancel_futures=True)

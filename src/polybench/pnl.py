@@ -27,10 +27,10 @@ log = logging.getLogger("polybench.pnl")
 class BookTop:
     """Minimal view of a single-token book top, enough to fill paper trades.
 
-    "Tradable" requires BOTH sides populated AND ask >= bid (not crossed).
-    A crossed or one-sided book is a transient glitch and attempting to
-    fill against it produces phantom PnL (e.g. buying at a fake $0.01 then
-    selling at $0.44 on the next tick when the real book returns).
+    Buy-side tradability requires a sane ask; sell-side/liquidation
+    tradability requires a sane bid. When both sides exist, the spread must
+    not be crossed or implausibly wide. This prevents phantom PnL from bad
+    synthetic books while still allowing exit marks on one-sided bid books.
     """
 
     best_bid: float
@@ -48,15 +48,21 @@ class BookTop:
 
     @property
     def is_tradable(self) -> bool:
-        return self.is_well_formed
+        return self.is_bid_tradable and self.is_ask_tradable
+
+    @property
+    def _spread_is_sane(self) -> bool:
+        if self.best_bid <= 0.0 or self.best_ask <= 0.0:
+            return True
+        return self.best_ask >= self.best_bid and (self.best_ask - self.best_bid) < 0.5
 
     @property
     def is_bid_tradable(self) -> bool:
-        return self.is_well_formed
+        return self.best_bid > 0.0 and self._spread_is_sane
 
     @property
     def is_ask_tradable(self) -> bool:
-        return self.is_well_formed
+        return self.best_ask > 0.0 and self._spread_is_sane
 
 
 @dataclass(frozen=True, slots=True)
@@ -260,8 +266,8 @@ class PaperSimulator:
         """Record liquidation-value MTM for the tick and return equity."""
         if self._current_event is None:
             raise RuntimeError("mark_to_market called with no active event")
-        up_exit = self._liquidation_price(up_book, self._current_event.last_up_exit)
-        down_exit = self._liquidation_price(down_book, self._current_event.last_down_exit)
+        up_exit = self._liquidation_price(up_book)
+        down_exit = self._liquidation_price(down_book)
         equity = self.position.equity(up_exit, down_exit)
         acc = self._current_event
         acc.last_up_exit = up_exit
@@ -272,9 +278,9 @@ class PaperSimulator:
 
     # ---- internal ----
 
-    def _liquidation_price(self, book: BookTop, fallback: float) -> float:
+    def _liquidation_price(self, book: BookTop) -> float:
         if not book.is_bid_tradable:
-            return fallback
+            return 0.0
         fill_price = book.best_bid * (1.0 - self._slippage)
         p = max(0.0, min(1.0, fill_price))
         return max(0.0, fill_price * (1.0 - self._fee_rate * p * (1.0 - p)))

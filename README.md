@@ -194,10 +194,11 @@ Polymarket order book:
   coin-flip position costs more.
 
 Your equity each tick is a liquidation mark: cash plus held shares valued
-at the current executable exit bid after slippage and exit fee. If the exit
-bid is temporarily not well formed, the simulator carries forward the last
-valid liquidation mark for that side. At event end, any held shares settle
-at the resolved `outcomePrices` (typically `[1, 0]` or `[0, 1]`).
+at the current executable exit bid after slippage and exit fee. A one-sided
+book with a valid bid can still mark or sell an existing long; a side with
+no valid bid marks at zero because it cannot be exited immediately. At event
+end, any held shares settle at the resolved `outcomePrices` (typically
+`[1, 0]` or `[0, 1]`).
 
 The important consequence: **you earn PnL from entering at good prices
 and riding the token to a better price — not from being "correct" about

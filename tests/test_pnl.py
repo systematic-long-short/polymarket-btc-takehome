@@ -129,7 +129,7 @@ def test_mark_to_market_uses_liquidation_bid_not_mid() -> None:
     assert equity == pytest.approx(1080.0, rel=1e-9)
 
 
-def test_mark_to_market_keeps_last_exit_mark_when_book_not_executable() -> None:
+def test_mark_to_market_uses_one_sided_bid_for_exit_value() -> None:
     sim = PaperSimulator(starting_capital=1000.0, slippage_bps=0.0, fee_rate=0.0)
     sim.start_event("E1", "ev1", ts=0.0, up_mid=0.5, down_mid=0.5)
     sim.apply_signal(
@@ -137,18 +137,30 @@ def test_mark_to_market_keeps_last_exit_mark_when_book_not_executable() -> None:
         _book(0.49, 0.50),
         _book(0.50, 0.51),
     )
-    first_equity = sim.mark_to_market(
-        BookTop(best_bid=0.54, best_ask=0.56, mid=0.55),
-        BookTop(best_bid=0.44, best_ask=0.46, mid=0.45),
-    )
 
-    second_equity = sim.mark_to_market(
+    equity = sim.mark_to_market(
         BookTop(best_bid=0.90, best_ask=0.0, mid=0.90),
         BookTop(best_bid=0.10, best_ask=0.20, mid=0.15),
     )
 
-    assert first_equity == pytest.approx(1080.0, rel=1e-9)
-    assert second_equity == pytest.approx(first_equity, rel=1e-9)
+    assert equity == pytest.approx(1800.0, rel=1e-9)
+
+
+def test_mark_to_market_marks_zero_when_position_has_no_exit_bid() -> None:
+    sim = PaperSimulator(starting_capital=1000.0, slippage_bps=0.0, fee_rate=0.0)
+    sim.start_event("E1", "ev1", ts=0.0, up_mid=0.5, down_mid=0.5)
+    sim.apply_signal(
+        Signal(side=Side.UP, size=1.0),
+        _book(0.49, 0.50),
+        _book(0.50, 0.51),
+    )
+
+    equity = sim.mark_to_market(
+        BookTop(best_bid=0.0, best_ask=0.90, mid=0.90),
+        BookTop(best_bid=0.10, best_ask=0.20, mid=0.15),
+    )
+
+    assert equity == pytest.approx(0.0, abs=1e-9)
 
 
 def test_untradable_side_skips_buy() -> None:

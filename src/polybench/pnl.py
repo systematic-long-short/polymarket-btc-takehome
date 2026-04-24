@@ -76,8 +76,8 @@ class Position:
     up_shares: float = 0.0
     down_shares: float = 0.0
 
-    def equity(self, up_mid: float, down_mid: float) -> float:
-        return self.cash + self.up_shares * up_mid + self.down_shares * down_mid
+    def equity(self, up_exit: float, down_exit: float) -> float:
+        return self.cash + self.up_shares * up_exit + self.down_shares * down_exit
 
 
 @dataclass
@@ -87,8 +87,8 @@ class _EventAcc:
     start_ts: float
     starting_equity: float
     last_mtm_equity: float
-    last_up_mid: float = 0.0
-    last_down_mid: float = 0.0
+    last_up_exit: float = 0.0
+    last_down_exit: float = 0.0
     n_trades: int = 0
     n_ticks: int = 0
     n_timeouts: int = 0
@@ -144,8 +144,8 @@ class PaperSimulator:
             start_ts=ts,
             starting_equity=starting_equity,
             last_mtm_equity=starting_equity,
-            last_up_mid=up_mid,
-            last_down_mid=down_mid,
+            last_up_exit=up_mid,
+            last_down_exit=down_mid,
         )
 
     def finish_event(
@@ -159,8 +159,8 @@ class PaperSimulator:
         acc = self._current_event
 
         # Establish final marks: use resolved prices if we have them, else
-        # keep the last observed mid (position remains open, would eventually
-        # settle but we finalize PnL here).
+        # keep the last observed liquidation marks (position remains open,
+        # would eventually settle but we finalize PnL here).
         resolved_known = (
             resolved_up_price is not None and resolved_down_price is not None
         )
@@ -168,8 +168,8 @@ class PaperSimulator:
             final_up = float(resolved_up_price)
             final_down = float(resolved_down_price)
         else:
-            final_up = acc.last_up_mid
-            final_down = acc.last_down_mid
+            final_up = acc.last_up_exit
+            final_down = acc.last_down_exit
 
         intra_pnl = acc.last_mtm_equity - acc.starting_equity
 
@@ -180,15 +180,15 @@ class PaperSimulator:
             + self.position.down_shares * final_down
         )
         still_held_mtm = (
-            self.position.up_shares * acc.last_up_mid
-            + self.position.down_shares * acc.last_down_mid
+            self.position.up_shares * acc.last_up_exit
+            + self.position.down_shares * acc.last_down_exit
         )
         resolution_pnl = payout - still_held_mtm
 
         # Always flatten at event end: tokens from event A are NOT fungible
         # with event B's tokens. If resolved, snap at $1/$0; otherwise cash
-        # out at the last observed mid prices (best approximation absent a
-        # resolution signal). Carrying positions across events produces
+        # out at the last observed liquidation marks (best approximation
+        # absent a resolution signal). Carrying positions across events produces
         # nonsensical MTM because the share count would be re-priced at
         # the next event's different tokens.
         self.position.cash += payout
@@ -257,22 +257,27 @@ class PaperSimulator:
         down_book: BookTop,
         ts: float | None = None,
     ) -> float:
-        """Record MTM for the tick and return current equity."""
+        """Record liquidation-value MTM for the tick and return equity."""
         if self._current_event is None:
             raise RuntimeError("mark_to_market called with no active event")
-        up_mid = up_book.mid if up_book.mid > 0.0 else self._current_event.last_up_mid
-        down_mid = (
-            down_book.mid if down_book.mid > 0.0 else self._current_event.last_down_mid
-        )
-        equity = self.position.equity(up_mid, down_mid)
+        up_exit = self._liquidation_price(up_book, self._current_event.last_up_exit)
+        down_exit = self._liquidation_price(down_book, self._current_event.last_down_exit)
+        equity = self.position.equity(up_exit, down_exit)
         acc = self._current_event
-        acc.last_up_mid = up_mid
-        acc.last_down_mid = down_mid
+        acc.last_up_exit = up_exit
+        acc.last_down_exit = down_exit
         acc.last_mtm_equity = equity
         acc.n_ticks += 1
         return equity
 
     # ---- internal ----
+
+    def _liquidation_price(self, book: BookTop, fallback: float) -> float:
+        if not book.is_bid_tradable:
+            return fallback
+        fill_price = book.best_bid * (1.0 - self._slippage)
+        p = max(0.0, min(1.0, fill_price))
+        return max(0.0, fill_price * (1.0 - self._fee_rate * p * (1.0 - p)))
 
     def _target_shares(
         self, signal: Signal, up_book: BookTop, down_book: BookTop

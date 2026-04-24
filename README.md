@@ -180,7 +180,7 @@ scanner rejects it statically.
   volatile wins: a strategy that earns $100 cleanly beats one that earns
   the same $100 after a 40% intra-run drawdown.
 
-**How PnL is computed.** PnL is mark-to-market, tick by tick. When you
+**How PnL is computed.** PnL is liquidation mark-to-market, tick by tick. When you
 send a signal, the simulator executes the delta against the current
 Polymarket order book:
 
@@ -193,10 +193,11 @@ Polymarket order book:
   extremes — buying a near-certain outcome costs very little, taking a
   coin-flip position costs more.
 
-Your equity each tick is
-`cash + up_shares × up_mid + down_shares × down_mid`. At event end, any
-held shares settle at the resolved `outcomePrices` (typically `[1, 0]`
-or `[0, 1]`).
+Your equity each tick is a liquidation mark: cash plus held shares valued
+at the current executable exit bid after slippage and exit fee. If the exit
+bid is temporarily not well formed, the simulator carries forward the last
+valid liquidation mark for that side. At event end, any held shares settle
+at the resolved `outcomePrices` (typically `[1, 0]` or `[0, 1]`).
 
 The important consequence: **you earn PnL from entering at good prices
 and riding the token to a better price — not from being "correct" about

@@ -64,9 +64,10 @@ python scripts/run_baseline.py --model momentum --duration 300
 > Polymarket CLOB `/book` data only; Gamma is used for event discovery and
 > resolution metadata, not for executable prices.
 >
-> Demo runs stop near the requested `--duration`. If the final event has not
-> resolved yet, it is reported as `UNKNOWN` rather than waiting minutes after
-> a short smoke test.
+> Completed events keep resolving in the background after rollover, so lagging
+> Polymarket settlement does not block the next market. Demo runs still stop
+> near the requested `--duration`; use `--postmortem-timeout` if you also want
+> to wait for a final in-flight event to resolve after the run window ends.
 
 ---
 
@@ -195,7 +196,9 @@ at the current executable exit bid after slippage and exit fee. A one-sided
 book with a valid bid can still mark or sell an existing long; a side with
 no valid bid marks at zero because it cannot be exited immediately. At event
 end, any held shares settle at the resolved `outcomePrices` (typically
-`[1, 0]` or `[0, 1]`).
+`[1, 0]` or `[0, 1]`). If Polymarket lags at rollover, the harness carries a
+provisional mark, starts the next event, and later applies the true settlement
+cash and event PnL as soon as Gamma reports the final outcome.
 
 The important consequence: **you earn PnL from entering at good prices
 and riding the token to a better price — not from being "correct" about
@@ -341,7 +344,9 @@ A: Clamped. Negative sizes are treated as zero.
 **Q: Does my position carry between events?**
 A: No. Event tokens are not fungible across consecutive 5-minute markets.
 Any shares still held at event end are settled against that event's final
-`outcomePrices`, then the simulator starts the next event flat. If you
+`outcomePrices`, then the simulator starts the next event flat. If Polymarket
+reports the final outcome late, that settlement is applied asynchronously while
+the next event continues trading. If you
 want to avoid resolution exposure, emit `FLAT` when `tick.time_to_resolve`
 drops near zero.
 

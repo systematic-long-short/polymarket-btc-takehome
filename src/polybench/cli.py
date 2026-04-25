@@ -160,13 +160,13 @@ def build_parser() -> argparse.ArgumentParser:
         "--resolution-timeout",
         type=float,
         default=45.0,
-        help="Seconds to wait for a just-ended event to resolve before marking UNKNOWN.",
+        help="Deprecated; event resolution now continues asynchronously after rollover.",
     )
     r.add_argument(
         "--postmortem-timeout",
         type=float,
         default=0.0,
-        help="Extra seconds after the run to refresh UNKNOWN resolutions (default 0).",
+        help="Extra seconds after the run to wait for still-pending resolutions (default 0).",
     )
     r.add_argument("--starting-capital", type=float, default=1000.0)
     r.add_argument("--slippage-bps", type=float, default=50.0, help="Default 50 = 0.5%% per order")

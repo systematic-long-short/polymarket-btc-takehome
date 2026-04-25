@@ -45,7 +45,7 @@ DEFAULT_MODEL_BUDGET_S = 0.5
 DEFAULT_CLOB_POLL_INTERVAL_S = 1.0
 DEFAULT_CLOB_WS_STALE_AFTER_S = 30.0
 CLOB_MARKET_WS_URL = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
-RESOLUTION_POLL_TIMEOUT_S = 45.0   # short live poll; postmortem pass catches lagging resolutions
+RESOLUTION_POLL_TIMEOUT_S = 45.0   # retained for CLI compatibility; rollover no longer blocks on it
 RESOLUTION_POLL_INTERVAL_S = 2.0
 EVENT_DISCOVERY_INTERVAL_S = 3.0   # probe Gamma every 3s while idle
 RESOLVED_EPSILON = 0.02            # |outcome_price - 1| < RESOLVED_EPSILON → resolved
@@ -121,11 +121,13 @@ class Harness:
         self._baseline_equity_curve: list[float] = []
         self._stop = asyncio.Event()
         self._clob_task: asyncio.Task | None = None
+        self._resolution_task: asyncio.Task | None = None
         self._executor = ThreadPoolExecutor(
             max_workers=4, thread_name_prefix="polybench-model"
         )
         self._pending_signal: Signal | None = None
         self._baseline_pending_signal: Signal | None = None
+        self._pending_resolution_events: dict[str, EventDescriptor] = {}
 
     # ---- public ----
 
@@ -134,25 +136,27 @@ class Harness:
         await self._pricefeed.start()
         await self._pricefeed.wait_ready(timeout=15.0)
         self._clob_task = asyncio.create_task(self._clob_poll_loop(), name="polybench-clob-ws")
+        self._resolution_task = asyncio.create_task(
+            self._pending_resolution_loop(), name="polybench-resolution"
+        )
         try:
             await self._tick_loop(started_ts)
         finally:
+            if self._current_event is not None:
+                self._finish_current_event(time.time(), resolved=False, outcome=None)
+            await self._postmortem_resolve_unknowns(
+                max_wait_s=self._cfg.postmortem_resolution_s,
+                poll_interval_s=self._cfg.postmortem_poll_interval_s,
+            )
             self._stop.set()
             if self._clob_task is not None:
                 with contextlib.suppress(asyncio.CancelledError):
                     self._clob_task.cancel()
                     await self._clob_task
-            if self._current_event is not None:
-                # Harness terminated mid-event — close with unknown resolution.
-                self._finish_current_event(time.time(), resolved=False, outcome=None)
-            # Post-mortem: any UNKNOWN events still in the simulator ledger get
-            # one last Gamma refresh — Polymarket sometimes lags the resolution
-            # flip by a few minutes, and this catches them without blocking the
-            # event rollover during the run.
-            await self._postmortem_resolve_unknowns(
-                max_wait_s=self._cfg.postmortem_resolution_s,
-                poll_interval_s=self._cfg.postmortem_poll_interval_s,
-            )
+            if self._resolution_task is not None:
+                with contextlib.suppress(asyncio.CancelledError):
+                    self._resolution_task.cancel()
+                    await self._resolution_task
             if self._own_pricefeed:
                 await self._pricefeed.stop()
             if self._own_client:
@@ -177,11 +181,8 @@ class Harness:
         while not self._stop.is_set():
             now = time.time()
             if now >= deadline:
-                # Grace: if an event is active and its endDate is within a
-                # minute past, let resolution poll complete rather than closing
-                # with UNKNOWN. Caps the extra wait at RESOLUTION_POLL_TIMEOUT_S.
                 if self._current_event is not None and now >= self._current_event.end_date_ts:
-                    log.info("harness: duration elapsed, resolving final event before stop")
+                    log.info("harness: duration elapsed, closing final ended event")
                     await self._resolve_and_rollover(now)
                 log.info("harness: duration elapsed, stopping")
                 return
@@ -365,21 +366,24 @@ class Harness:
     async def _resolve_and_rollover(self, now: float) -> None:
         event = self._current_event
         assert event is not None
-        outcome = await self._poll_resolution(event)
+        outcome = await self._read_resolved_outcome(event)
         resolved = outcome is not None
-        if not resolved:
-            # Gamma's bestBid/bestAsk go stale after the market closes, but
-            # outcomePrices stay accurate (they're the UMA-reported market
-            # mid, snapping to 0/1 post-resolution). If we have even a close
-            # approximation from the last refresh, prefer those over the
-            # stale top-of-book for final flattening.
-            try:
-                refreshed = await self._client.refresh_event(event.slug)
-            except Exception:  # noqa: BLE001
-                refreshed = None
-            if refreshed is not None and sum(refreshed.outcome_prices) > 0.0:
-                outcome = refreshed.outcome_prices
         self._finish_current_event(now, resolved=outcome is not None, outcome=outcome)
+
+    async def _pending_resolution_loop(self) -> None:
+        while not self._stop.is_set():
+            await self._resolve_pending_once()
+            await asyncio.sleep(RESOLUTION_POLL_INTERVAL_S)
+
+    async def _resolve_pending_once(self) -> int:
+        resolved_count = 0
+        for slug, event in list(self._pending_resolution_events.items()):
+            outcome = await self._read_resolved_outcome(event)
+            if outcome is None:
+                continue
+            if self._apply_late_resolution(slug, outcome, time.time()):
+                resolved_count += 1
+        return resolved_count
 
     async def _postmortem_resolve_unknowns(
         self,
@@ -387,76 +391,23 @@ class Harness:
         max_wait_s: float = 600.0,
         poll_interval_s: float = 10.0,
     ) -> None:
-        """After the run, re-query Gamma for events still marked UNKNOWN.
-
-        Polymarket sometimes lags its resolution flip by 60–180 s past
-        ``endDate``. The live ``_poll_resolution`` budget is short (so event
-        rollover stays tight), so this post-mortem is where lagging events
-        get upgraded. Retries every ``poll_interval_s`` until all events
-        resolve or ``max_wait_s`` elapses. Updates BOTH the model and the
-        baseline event ledgers — they share the same slug stream so a
-        single Gamma refresh resolves both tracks.
-        """
-        import dataclasses as _dc
-
+        """Optional final wait for events still unresolved at run shutdown."""
         if max_wait_s <= 0.0:
             return
-
-        model_events = self._simulator._completed_events
-        baseline_events = self._baseline_simulator._completed_events
-        if not model_events and not baseline_events:
-            return
-
-        def _label_from(refreshed) -> str | None:
-            up, down = refreshed.outcome_prices
-            if up > (1.0 - RESOLVED_EPSILON) and down < RESOLVED_EPSILON:
-                return "UP"
-            if down > (1.0 - RESOLVED_EPSILON) and up < RESOLVED_EPSILON:
-                return "DOWN"
-            if refreshed.closed:
-                return "UP" if up >= down else "DOWN"
-            return None
 
         deadline = time.time() + max_wait_s
         total_upgraded = 0
         iteration = 0
-        while time.time() < deadline:
+        while self._pending_resolution_events and time.time() < deadline:
             iteration += 1
-            # Collect all unique UNKNOWN slugs across both ledgers.
-            unknown_slugs = {
-                e.slug for e in model_events if e.resolved_outcome == "UNKNOWN"
-            } | {
-                e.slug for e in baseline_events if e.resolved_outcome == "UNKNOWN"
-            }
-            if not unknown_slugs:
-                break
-            log.info("postmortem iter %d: %d UNKNOWN slugs remaining", iteration, len(unknown_slugs))
-            iter_upgraded = 0
-            for slug in unknown_slugs:
-                try:
-                    refreshed = await self._client.refresh_event(slug)
-                except Exception as exc:  # noqa: BLE001
-                    log.debug("postmortem refresh failed for %s: %s", slug, exc)
-                    continue
-                if refreshed is None:
-                    continue
-                label = _label_from(refreshed)
-                if label is None:
-                    continue
-                for ledger in (model_events, baseline_events):
-                    for i, ev in enumerate(ledger):
-                        if ev.slug == slug and ev.resolved_outcome == "UNKNOWN":
-                            ledger[i] = _dc.replace(ev, resolved_outcome=label)
-                            iter_upgraded += 1
-                            total_upgraded += 1
+            log.info(
+                "postmortem iter %d: %d unresolved slugs remaining",
+                iteration,
+                len(self._pending_resolution_events),
+            )
+            iter_upgraded = await self._resolve_pending_once()
+            total_upgraded += iter_upgraded
             if iter_upgraded == 0:
-                remaining = {
-                    e.slug for e in model_events if e.resolved_outcome == "UNKNOWN"
-                } | {
-                    e.slug for e in baseline_events if e.resolved_outcome == "UNKNOWN"
-                }
-                if not remaining:
-                    break
                 remaining_wait = deadline - time.time()
                 if remaining_wait <= 0.0:
                     break
@@ -464,40 +415,57 @@ class Harness:
         if total_upgraded:
             log.info("postmortem: upgraded %d UNKNOWN event rows", total_upgraded)
 
-    async def _poll_resolution(
+    async def _read_resolved_outcome(
         self, event: EventDescriptor
     ) -> tuple[float, float] | None:
-        """Poll the same Gamma slug until ``closed=true`` and outcomePrices
-        saturate to [1,0] or [0,1]. No cross-source fallback — if Polymarket
-        hasn't resolved within the timeout, return ``None`` (UNKNOWN)."""
-        timeout_s = max(0.0, self._cfg.resolution_poll_timeout_s)
-        deadline = time.time() + timeout_s
-        while time.time() < deadline and not self._stop.is_set():
-            try:
-                refreshed = await self._client.refresh_event(event.slug)
-            except Exception as exc:  # noqa: BLE001
-                log.warning("resolution poll (refresh) failed: %s", exc)
-                refreshed = None
-            if refreshed is not None:
-                up, down = refreshed.outcome_prices
-                is_resolved_up = up > (1.0 - RESOLVED_EPSILON) and down < RESOLVED_EPSILON
-                is_resolved_down = down > (1.0 - RESOLVED_EPSILON) and up < RESOLVED_EPSILON
-                # Accept resolution if EITHER Gamma flags closed=true OR the
-                # outcomePrices saturate. Polymarket's closed flag lags the
-                # price saturation by 10–60s on many events.
-                if is_resolved_up or is_resolved_down:
-                    return (up, down)
-                if refreshed.closed:
-                    # closed but not saturated → weird; treat as resolved with
-                    # whatever prices are there.
-                    return (up, down)
-            await asyncio.sleep(RESOLUTION_POLL_INTERVAL_S)
-        log.warning(
-            "event %s did not resolve within %.0fs — closing with UNKNOWN outcome",
-            event.slug,
-            timeout_s,
-        )
+        """Return final [1,0]/[0,1] prices once Gamma outcomePrices saturate."""
+        try:
+            refreshed = await self._client.refresh_event(event.slug)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("resolution refresh failed for %s: %s", event.slug, exc)
+            return None
+        if refreshed is None:
+            return None
+        up, down = refreshed.outcome_prices
+        if up > (1.0 - RESOLVED_EPSILON) and down < RESOLVED_EPSILON:
+            return (1.0, 0.0)
+        if down > (1.0 - RESOLVED_EPSILON) and up < RESOLVED_EPSILON:
+            return (0.0, 1.0)
         return None
+
+    def _apply_late_resolution(
+        self,
+        slug: str,
+        outcome: tuple[float, float],
+        now: float,
+    ) -> bool:
+        event = self._pending_resolution_events.pop(slug, None)
+        if event is None:
+            return False
+        model_result = self._simulator.settle_pending_event(slug, now, outcome[0], outcome[1])
+        baseline_result = self._baseline_simulator.settle_pending_event(
+            slug, now, outcome[0], outcome[1]
+        )
+        resolved_outcome = (
+            model_result.resolved_outcome
+            if model_result is not None
+            else _outcome_label(outcome)
+        )
+        self._recorder.update_resolution(
+            slug=slug,
+            resolution_up=outcome[0],
+            resolution_down=outcome[1],
+            resolved_outcome=resolved_outcome,
+        )
+        if model_result is not None:
+            log.info(
+                "event %s resolved late: model=%.4f baseline=%.4f outcome=%s",
+                event.slug,
+                model_result.pnl_total,
+                baseline_result.pnl_total if baseline_result is not None else 0.0,
+                resolved_outcome,
+            )
+        return True
 
     def _finish_current_event(
         self,
@@ -553,6 +521,8 @@ class Harness:
             resolved_outcome=event_result.resolved_outcome,
         )
         self._recorder.record(row)
+        if not resolved:
+            self._pending_resolution_events[event.slug] = event
         self._current_event = None
         self._cached_up_book = None
         self._cached_down_book = None
@@ -924,6 +894,15 @@ def _ws_timestamp_to_seconds(value: Any) -> float:
     if ts > 10_000_000_000.0:
         return ts / 1000.0
     return ts
+
+
+def _outcome_label(outcome: tuple[float, float]) -> str:
+    up, down = outcome
+    if up >= 0.99 and down <= 0.01:
+        return "UP"
+    if down >= 0.99 and up <= 0.01:
+        return "DOWN"
+    return "UNKNOWN"
 
 
 def _json_default(obj: Any) -> Any:

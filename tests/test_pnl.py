@@ -299,3 +299,29 @@ def test_timeout_counted_per_tick() -> None:
     result = sim.finish_event(ts=100.0, resolved_up_price=1.0, resolved_down_price=0.0)
     assert result.n_timeouts == 2
     assert result.n_ticks == 2
+
+
+def test_late_settlement_updates_prior_event_without_polluting_current_event() -> None:
+    sim = PaperSimulator(starting_capital=1000.0, slippage_bps=0.0, fee_rate=0.0)
+    book = _book(0.50, 0.50)
+
+    sim.start_event("E1", "ev1", ts=0.0, up_mid=0.5, down_mid=0.5)
+    sim.position.cash = 950.0
+    sim.position.up_shares = 100.0
+    sim.mark_to_market(book, book)
+    provisional = sim.finish_event(ts=300.0, resolved_up_price=None, resolved_down_price=None)
+    assert provisional.resolved_outcome == "UNKNOWN"
+    assert provisional.pnl_total == pytest.approx(0.0)
+    assert sim.position.cash == pytest.approx(1000.0)
+
+    sim.start_event("E2", "ev2", ts=301.0, up_mid=0.5, down_mid=0.5)
+    settled = sim.settle_pending_event("ev1", 360.0, 1.0, 0.0)
+    assert settled is not None
+    assert settled.resolved_outcome == "UP"
+    assert settled.pnl_resolution == pytest.approx(50.0)
+    assert settled.pnl_total == pytest.approx(50.0)
+    assert sim.position.cash == pytest.approx(1050.0)
+
+    current = sim.finish_event(ts=600.0, resolved_up_price=None, resolved_down_price=None)
+    assert current.slug == "ev2"
+    assert current.pnl_total == pytest.approx(0.0)

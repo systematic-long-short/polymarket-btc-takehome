@@ -19,6 +19,10 @@ Use the default `--price-source polymarket` unless you are intentionally
 debugging an auxiliary BTC spot feed. Official scoring should depend only on
 Polymarket Gamma/CLOB availability. Gamma discovers and resolves events; fills
 and marks require live CLOB WebSocket books for both UP and DOWN tokens.
+Completed events resolve asynchronously after rollover, so lagging Gamma
+settlement should not stop the harness from trading the next market. Keep
+`--postmortem-timeout 600` for official runs so a final in-flight event has a
+chance to resolve after the requested run window ends.
 
 ```bash
 # Set up a fresh working dir per candidate.

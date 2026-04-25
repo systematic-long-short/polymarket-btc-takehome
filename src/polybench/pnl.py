@@ -16,7 +16,7 @@ from __future__ import annotations
 
 import logging
 import math
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 
 from polybench.model import EventResult, Side, Signal
 
@@ -100,6 +100,17 @@ class _EventAcc:
     n_timeouts: int = 0
 
 
+@dataclass
+class _PendingSettlement:
+    event_index: int
+    slug: str
+    provisional_up: float
+    provisional_down: float
+    up_shares: float
+    down_shares: float
+    still_held_mtm: float
+
+
 class PaperSimulator:
     """Stateful paper-trading simulator spanning one full harness run.
 
@@ -121,6 +132,7 @@ class PaperSimulator:
         self.position = Position(cash=self._starting_capital)
         self._current_event: _EventAcc | None = None
         self._completed_events: list[EventResult] = []
+        self._pending_settlements: dict[str, _PendingSettlement] = {}
 
     # ---- event lifecycle ----
 
@@ -191,6 +203,9 @@ class PaperSimulator:
         )
         resolution_pnl = payout - still_held_mtm
 
+        held_up_shares = self.position.up_shares
+        held_down_shares = self.position.down_shares
+
         # Always flatten at event end: tokens from event A are NOT fungible
         # with event B's tokens. If resolved, snap at $1/$0; otherwise cash
         # out at the last observed liquidation marks (best approximation
@@ -202,15 +217,7 @@ class PaperSimulator:
         self.position.down_shares = 0.0
 
         # Determine outcome label.
-        if resolved_known:
-            if final_up >= 0.99 and final_down <= 0.01:
-                outcome = "UP"
-            elif final_down >= 0.99 and final_up <= 0.01:
-                outcome = "DOWN"
-            else:
-                outcome = "UNKNOWN"
-        else:
-            outcome = "UNKNOWN"
+        outcome = _outcome_label(final_up, final_down) if resolved_known else "UNKNOWN"
 
         total_pnl = intra_pnl + resolution_pnl
         result = EventResult(
@@ -227,8 +234,58 @@ class PaperSimulator:
             n_timeouts=acc.n_timeouts,
         )
         self._completed_events.append(result)
+        if not resolved_known:
+            self._pending_settlements[acc.slug] = _PendingSettlement(
+                event_index=len(self._completed_events) - 1,
+                slug=acc.slug,
+                provisional_up=final_up,
+                provisional_down=final_down,
+                up_shares=held_up_shares,
+                down_shares=held_down_shares,
+                still_held_mtm=still_held_mtm,
+            )
         self._current_event = None
         return result
+
+    def settle_pending_event(
+        self,
+        slug: str,
+        ts: float,
+        resolved_up_price: float,
+        resolved_down_price: float,
+    ) -> EventResult | None:
+        pending = self._pending_settlements.pop(slug, None)
+        if pending is None:
+            return None
+        if not (0 <= pending.event_index < len(self._completed_events)):
+            return None
+
+        final_up = float(resolved_up_price)
+        final_down = float(resolved_down_price)
+        old = self._completed_events[pending.event_index]
+
+        provisional_payout = (
+            pending.up_shares * pending.provisional_up
+            + pending.down_shares * pending.provisional_down
+        )
+        final_payout = pending.up_shares * final_up + pending.down_shares * final_down
+        cash_delta = final_payout - provisional_payout
+        if abs(cash_delta) > 1e-12:
+            self.position.cash += cash_delta
+            if self._current_event is not None:
+                self._current_event.starting_equity += cash_delta
+                self._current_event.last_mtm_equity += cash_delta
+
+        resolution_pnl = final_payout - pending.still_held_mtm
+        outcome = _outcome_label(final_up, final_down)
+        updated = replace(
+            old,
+            resolved_outcome=outcome,
+            pnl_total=old.pnl_intra_event + resolution_pnl,
+            pnl_resolution=resolution_pnl,
+        )
+        self._completed_events[pending.event_index] = updated
+        return updated
 
     # ---- per-tick ----
 
@@ -355,3 +412,11 @@ class PaperSimulator:
             notional=notional,
             fee=fee,
         )
+
+
+def _outcome_label(up_price: float, down_price: float) -> str:
+    if up_price >= 0.99 and down_price <= 0.01:
+        return "UP"
+    if down_price >= 0.99 and up_price <= 0.01:
+        return "DOWN"
+    return "UNKNOWN"

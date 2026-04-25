@@ -17,6 +17,7 @@ from polybench import FLAT, Model, Side, Signal, Tick
 from polybench.baselines import MomentumBaseline
 from polybench.harness import Harness, HarnessConfig
 from polybench.market import Book, EventDescriptor, Level
+from polybench.pnl import BookTop
 from polybench.replay import ReplayConfig, replay
 
 
@@ -66,6 +67,15 @@ class _RefreshCountingClient:
     async def refresh_event(self, slug: str):
         self.refresh_calls += 1
         return None
+
+
+class _ResolvedClient:
+    async def refresh_event(self, slug: str):
+        event = _event()
+        event.slug = slug
+        event.closed = True
+        event.outcome_prices = (1.0, 0.0)
+        return event
 
 
 class _MissingBookClient:
@@ -299,5 +309,41 @@ def test_clob_websocket_payload_updates_real_book_cache(tmp_path: Path) -> None:
         assert harness._cached_down_book is not None
         assert harness._cached_down_book.best_bid == pytest.approx(0.47)
         assert harness._cached_down_book.best_ask == pytest.approx(0.53)
+    finally:
+        harness._executor.shutdown(wait=False, cancel_futures=True)
+
+
+def test_late_resolution_updates_report_ledger_and_settlement_row(tmp_path: Path) -> None:
+    event = _event()
+    harness = Harness(
+        _FlatModel(),
+        HarnessConfig(output_dir=tmp_path / "out"),
+        client=_ResolvedClient(),  # type: ignore[arg-type]
+        baseline_model=_FlatModel(),
+    )
+    try:
+        harness._current_event = event
+        harness._cached_up_book = _book_obj("UP", 0.50, 0.50)
+        harness._cached_down_book = _book_obj("DOWN", 0.50, 0.50)
+        harness._on_event_start(event, now=0.0)
+        for simulator in (harness._simulator, harness._baseline_simulator):
+            simulator.position.cash = 950.0
+            simulator.position.up_shares = 100.0
+            simulator.mark_to_market(
+                BookTop(best_bid=0.50, best_ask=0.50, mid=0.50),
+                BookTop(best_bid=0.50, best_ask=0.50, mid=0.50),
+            )
+
+        harness._finish_current_event(now=300.0, resolved=False, outcome=None)
+        assert harness._recorder._rows[-1]["resolved_outcome"] == "UNKNOWN"
+
+        resolved = asyncio.run(harness._resolve_pending_once())
+
+        assert resolved == 1
+        assert harness._simulator.completed_events[-1].resolved_outcome == "UP"
+        assert harness._simulator.completed_events[-1].pnl_total == pytest.approx(50.0)
+        assert harness._recorder._rows[-1]["resolved_outcome"] == "UP"
+        assert harness._recorder._rows[-1]["resolution_up"] == pytest.approx(1.0)
+        assert harness._recorder._rows[-1]["resolution_down"] == pytest.approx(0.0)
     finally:
         harness._executor.shutdown(wait=False, cancel_futures=True)

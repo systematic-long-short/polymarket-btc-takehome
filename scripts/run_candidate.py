@@ -118,13 +118,13 @@ def main(argv: list[str] | None = None) -> int:
         "--resolution-timeout",
         type=float,
         default=45.0,
-        help="Seconds to wait for a just-ended event to resolve before marking UNKNOWN.",
+        help="Deprecated; event resolution now continues asynchronously after rollover.",
     )
     p.add_argument(
         "--postmortem-timeout",
         type=float,
         default=0.0,
-        help="Extra seconds after the run to refresh UNKNOWN resolutions (default 0).",
+        help="Extra seconds after the run to wait for still-pending resolutions (default 0).",
     )
     p.add_argument("--memory-mb", type=int, default=4096,
                    help="Best-effort process virtual memory cap for the candidate run.")

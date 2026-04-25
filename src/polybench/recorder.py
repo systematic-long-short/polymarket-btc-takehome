@@ -106,6 +106,24 @@ class Recorder:
         filled = {col: row.get(col, _default_for(col)) for col in TICK_COLUMNS}
         self._rows.append(filled)
 
+    def update_resolution(
+        self,
+        *,
+        slug: str,
+        resolution_up: float,
+        resolution_down: float,
+        resolved_outcome: str,
+    ) -> None:
+        for row in reversed(self._rows):
+            if row.get("slug") != slug:
+                continue
+            if not row.get("resolved_outcome"):
+                continue
+            row["resolution_up"] = resolution_up
+            row["resolution_down"] = resolution_down
+            row["resolved_outcome"] = resolved_outcome
+            return
+
     def __len__(self) -> int:
         return len(self._rows)
 

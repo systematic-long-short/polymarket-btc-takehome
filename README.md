@@ -12,6 +12,22 @@ trades the same tape. Beating it is the bar.
 
 ---
 
+## AI-native participation is expected
+
+We expect strong candidates to solve this in an AI-native way. You should use
+LLMs, agents, prompt iteration, code generation, critique loops, and empirical
+evaluation to work your way toward a better strategy. We are not testing whether
+you can hand-write a first draft in isolation; we are testing whether you can
+direct AI tools toward a novel, logical, scanner-safe trading model that
+actually works in this harness.
+
+That raises the bar. A good submission should show a concrete market hypothesis,
+clear risk controls, and live or replay evidence that it beats the shipped
+baseline on the same tape. Prompt your way into a strong solution, then verify
+it. We will read the code and the results, not the prompt transcript.
+
+---
+
 ## The task
 
 Subclass `polybench.Model`, implement `on_tick(tick) -> Signal`, submit.

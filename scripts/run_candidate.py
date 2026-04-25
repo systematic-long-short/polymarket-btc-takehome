@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import json
 import importlib.util
 import os
 import sys
@@ -31,9 +32,34 @@ SAFE_ENV_KEYS = frozenset({
     "LANG",
     "LC_ALL",
     "LC_CTYPE",
+    "POLYBENCH_CONTAINER_DIGEST",
+    "POLYBENCH_CONTAINER_IMAGE",
+    "POLYBENCH_OFFICIAL_EVALUATOR",
     "PYTHONHASHSEED",
     "TZ",
 })
+
+SENSITIVE_ENV_PREFIXES = (
+    "AWS_",
+    "AZURE_",
+    "GCP_",
+    "GOOGLE_",
+    "OPENAI_",
+    "ANTHROPIC_",
+    "GITHUB_",
+    "DOCKER_",
+)
+SENSITIVE_ENV_KEYS = {
+    "API_KEY",
+    "AUTH_TOKEN",
+    "DOCKER_HOST",
+    "GH_TOKEN",
+    "GITHUB_TOKEN",
+    "HF_TOKEN",
+    "KUBECONFIG",
+    "SECRET",
+    "TOKEN",
+}
 
 
 def _running_in_container() -> bool:
@@ -81,6 +107,72 @@ def _apply_resource_limits(*, memory_mb: int, file_size_mb: int) -> None:
         _set_limit(resource.RLIMIT_NOFILE, 256)
     except (OSError, ValueError) as exc:
         print(f"WARNING: could not apply fd limit: {exc}", file=sys.stderr)
+
+
+def _path_is_read_only(path: Path) -> bool:
+    probe = path / f".polybench-write-probe-{os.getpid()}"
+    try:
+        probe.write_text("probe")
+    except OSError:
+        return True
+    try:
+        probe.unlink()
+    except OSError:
+        pass
+    return False
+
+
+def _official_isolation_failures(*, submission: Path, output_dir: Path) -> list[str]:
+    failures: list[str] = []
+    if not _running_in_container():
+        failures.append("not running inside a container")
+    if hasattr(os, "geteuid") and os.geteuid() == 0:
+        failures.append("container user is root")
+    if Path("/var/run/docker.sock").exists():
+        failures.append("Docker socket is mounted inside the evaluator")
+
+    out = output_dir.resolve()
+    if not (str(out) == "/output" or str(out).startswith("/output/")):
+        failures.append("official output directory must be under /output")
+    else:
+        try:
+            out.mkdir(parents=True, exist_ok=True)
+            probe = out / f".polybench-output-probe-{os.getpid()}"
+            probe.write_text("probe")
+            probe.unlink()
+        except OSError as exc:
+            failures.append(f"official output directory is not writable: {exc}")
+
+    if submission.exists() and not _path_is_read_only(submission.parent):
+        failures.append("submission mount is writable")
+
+    workdir = Path("/polybench")
+    if workdir.exists() and not _path_is_read_only(workdir):
+        failures.append("evaluator filesystem is writable; expected --read-only")
+
+    exposed = []
+    for key in os.environ:
+        if key in SAFE_ENV_KEYS:
+            continue
+        if key in SENSITIVE_ENV_KEYS or any(key.startswith(prefix) for prefix in SENSITIVE_ENV_PREFIXES):
+            exposed.append(key)
+    if exposed:
+        failures.append("sensitive environment variables are present: " + ", ".join(sorted(exposed)))
+    if os.environ.get("POLYBENCH_OFFICIAL_EVALUATOR") != "1":
+        failures.append("POLYBENCH_OFFICIAL_EVALUATOR=1 was not set by the official runner")
+    return failures
+
+
+def _unknown_event_count(report_path: Path) -> int:
+    try:
+        payload = json.loads(report_path.read_text())
+    except (OSError, json.JSONDecodeError):
+        return 0
+    status = payload.get("scoring_status", {})
+    try:
+        return int(status.get("unresolved_event_count", 0))
+    except (TypeError, ValueError):
+        return 0
 
 
 def _load_module(path: Path, class_name: str, config):
@@ -147,12 +239,26 @@ def main(argv: list[str] | None = None) -> int:
             "Use this for evaluator automation with untrusted submissions."
         ),
     )
+    p.add_argument(
+        "--official",
+        action="store_true",
+        help="Fail closed unless official container isolation checks pass.",
+    )
+    p.add_argument(
+        "--allow-unresolved-final",
+        action="store_true",
+        help="Official-only override: accept a final report even if events are still UNKNOWN.",
+    )
     args = p.parse_args(argv)
 
     path = Path(args.submission).resolve()
     if not path.is_file():
         print(f"ERROR: submission file not found: {path}", file=sys.stderr)
         return 2
+    out_dir = Path(
+        args.output_dir or f"runs/candidate_{path.stem}_{int(time.time())}"
+    )
+
     if args.require_container and not _running_in_container():
         print(
             "ERROR: refusing to import an untrusted submission outside a container. "
@@ -161,6 +267,19 @@ def main(argv: list[str] | None = None) -> int:
             file=sys.stderr,
         )
         return 2
+    if args.official:
+        if args.allow_unsafe or args.keep_env or args.no_limits:
+            print(
+                "ERROR: --official cannot be combined with debug-only bypass flags.",
+                file=sys.stderr,
+            )
+            return 2
+        failures = _official_isolation_failures(submission=path, output_dir=out_dir)
+        if failures:
+            print("ERROR: official evaluator isolation checks failed:", file=sys.stderr)
+            for failure in failures:
+                print(f"  - {failure}", file=sys.stderr)
+            return 2
 
     print(f"scanning {path}...")
     report = scan_file(path)
@@ -182,9 +301,6 @@ def main(argv: list[str] | None = None) -> int:
 
     model = _load_module(path, args.class_name, _load_config(args.config))
 
-    out_dir = Path(
-        args.output_dir or f"runs/candidate_{path.stem}_{int(time.time())}"
-    )
     cfg = HarnessConfig(
         duration_s=args.duration,
         starting_capital=args.starting_capital,
@@ -194,11 +310,25 @@ def main(argv: list[str] | None = None) -> int:
         output_dir=out_dir,
         resolution_poll_timeout_s=args.resolution_timeout,
         postmortem_resolution_s=args.postmortem_timeout,
+        candidate_path=path,
+        command=tuple(sys.argv if argv is None else [sys.argv[0], *argv]),
+        official_scoring=args.official,
+        allow_unresolved_final=args.allow_unresolved_final,
     )
     result = asyncio.run(Harness(model=model, config=cfg).run())
     print(format_summary(result))
-    print(f"report: {out_dir / 'report.json'}")
+    report_path = out_dir / "report.json"
+    print(f"report: {report_path}")
     print(f"ticks:  {out_dir / 'ticks.parquet'}")
+    unknown_events = _unknown_event_count(report_path)
+    if args.official and unknown_events and not args.allow_unresolved_final:
+        print(
+            "PENDING RESOLUTION: official score is not final because "
+            f"{unknown_events} completed event(s) are still UNKNOWN. Run "
+            "scripts/reconcile_resolutions.py after Gamma publishes final outcomes.",
+            file=sys.stderr,
+        )
+        return 3
     return 0
 
 

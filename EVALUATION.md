@@ -1,132 +1,193 @@
-# EVALUATION — scoring notes for reviewers
+# EVALUATION — reviewer workflow
 
-Internal. Not distributed to candidates; candidates see `README.md`.
+Internal. Do not distribute this file to candidates; candidates only need
+`README.md` and a single `model_submission.py`.
 
-> **Scoring runs land only against live Polymarket. There is no accepted
-> substitute.** Replay against the committed fixture is an iteration aid, not
-> a scoring input. If the scoring window has a network or Polymarket
-> outage, pause the run and restart — do NOT fall back to the fixture or to
-> any other price source for PnL.
+## Non-negotiable market data policy
 
-## The scoring pass
+- Official scoring is live-only against Polymarket BTC 5-minute up/down events.
+- Polymarket CLOB order books are the only source for executable fills and
+  marks.
+- Gamma is allowed for event discovery and final resolution metadata only.
+- There is no synthetic book fill path and no Gamma executable-price fallback.
+- Do not use Coinbase or Binance-US.
+- The optional BTC spot feed is either disabled (`--price-source polymarket`,
+  the default) or Binance global (`--price-source binance`).
+- Candidate signals execute on the next recorded tick, never the same tick.
+- Depth-aware execution is intentionally out of scope for this version.
+- Fees remain Polymarket-style per share:
+  `fee = shares * fee_rate * p * (1 - p)`.
 
-Run the candidate for a continuous **2-hour live window** (`--duration 7200`).
-The harness chains ~24 consecutive 5-min BTC events back-to-back and always
-runs `MomentumBaseline` in parallel on the same tape, so a single run
-produces the apples-to-apples Model-vs-Baseline comparison.
+## Pre-window operational soak
 
-Use the default `--price-source polymarket` unless you are intentionally
-debugging an auxiliary BTC spot feed. Official scoring should depend only on
-Polymarket Gamma/CLOB availability. Gamma discovers and resolves events; fills
-and marks require live CLOB WebSocket books for both UP and DOWN tokens.
-Completed events resolve asynchronously after rollover, so lagging Gamma
-settlement should not stop the harness from trading the next market. Keep
-`--postmortem-timeout 600` for official runs so a final in-flight event has a
-chance to resolve after the requested run window ends.
+Run a soak shortly before a scoring window. This loads only the reference
+MomentumBaseline and validates the live feed path:
 
 ```bash
-# Set up a fresh working dir per candidate.
-mkdir -p runs/<candidate_id>
-
-# 1. Scan. Must return "accept" (exit 0). If not, reject.
-python scripts/scan_submission.py --file <submission>/model_submission.py
-
-# 2. Build the evaluator image once per repo revision.
-docker build -t polybench-eval .
-
-# 3. Run candidate live inside a container. Baseline runs alongside automatically.
-docker run --rm \
-    --entrypoint python \
-    --network bridge \
-    --cpus 2 \
-    --memory 4g \
-    --pids-limit 256 \
-    --read-only \
-    --tmpfs /tmp:rw,noexec,nosuid,nodev,size=128m \
-    -v "$(realpath <submission>/model_submission.py):/submission/model_submission.py:ro" \
-    -v "$(pwd)/runs/<candidate_id>:/runs/<candidate_id>" \
-    polybench-eval \
-    scripts/run_candidate.py \
-        --submission /submission/model_submission.py \
-        --duration 7200 \
-        --output /runs/<candidate_id> \
-        --require-container \
-        --postmortem-timeout 600
+python scripts/soak_validate.py \
+    --duration 3600 \
+    --price-source polymarket \
+    --postmortem-timeout 120 \
+    --min-events 10 \
+    --max-clob-stale-count 0 \
+    --max-missing-book-fraction 0.20
 ```
 
-## Metrics in `report.json`
+If you intend to expose the optional BTC spot fields during candidate scoring,
+also run:
 
-`report.json` has two top-level blocks, `model` and `baseline`, each with
-the same schema. The scoring comparison is always between the two.
+```bash
+python scripts/soak_validate.py \
+    --duration 3600 \
+    --price-source binance \
+    --postmortem-timeout 120 \
+    --min-events 10 \
+    --max-clob-stale-count 0 \
+    --max-missing-book-fraction 0.20
+```
 
-**Primary score (the headline):**
+The validation output checks active tick coverage, CLOB book freshness,
+WebSocket reconnect/stale counts, missing and one-sided book rows, Gamma
+discovery/resolution lag, unknown event count, and BTC source mode. If the
+soak fails, postpone scoring rather than substituting replay data or another
+price source.
 
-    primary_score = pnl_total × max(sharpe, 0) × (1 − max_drawdown)
+## Official candidate run
 
-A winning model with high Sharpe and small drawdown produces a large
-positive score. `pnl_total` is the full run-total PnL, not a per-trade or
-per-event average. Negative Sharpe is floored at zero for scoring, so a
-net loser cannot receive a positive headline score from negative PnL times
-negative Sharpe.
+Use the host-side runner. It builds or reuses the evaluator image, mounts only
+the candidate file read-only, mounts one writable output directory at
+`/output`, and runs the candidate inside a locked-down container:
 
-**Secondary (risk + consistency):**
+```bash
+mkdir -p runs/<candidate_id>
 
-- `sharpe` / `sortino` — annualized.
-- `max_drawdown` — peak-to-trough fraction.
-- `hit_rate` — fraction of events closed positive.
-- `timeout_rate` — fraction of ticks where `on_tick` overran.
-- `n_events`, `n_trades`, `n_ticks` — throughput metadata.
+python scripts/run_official_evaluation.py \
+    --submission <submission_dir>/model_submission.py \
+    --output runs/<candidate_id> \
+    --duration 7200 \
+    --price-source polymarket \
+    --postmortem-timeout 600
+```
 
-**Analytical (PnL attribution):**
+The runner applies:
 
-- `pnl_intra_event` vs `pnl_resolution` — a model whose PnL comes
-  overwhelmingly from resolution is just directionally betting. A model
-  with high intra-event PnL is actually trading.
-- `outcome_accuracy` — proxy for directional correctness. Low outcome
-  accuracy with high PnL means the candidate profits by timing.
+- non-root container user
+- read-only image filesystem plus tmpfs `/tmp` and `/run`
+- no mounted evaluator secrets
+- no Docker socket mount
+- `--cap-drop ALL`
+- `--security-opt no-new-privileges`
+- PID, memory, CPU, file-size, and file-descriptor limits
+- one controlled writable output mount
 
-## The bar
+Inside the container, `scripts/run_candidate.py --official` performs its own
+fail-closed checks before importing candidate code. It rejects debug bypass
+flags, root execution, writable evaluator filesystem, writable submission
+mount, mounted Docker socket, missing official-run marker, and sensitive
+environment variables.
 
-A submission **passes** if, on the same 2-hour window (both values read
-from the candidate's `report.json`):
+Trusted local debugging can still use:
 
-- `model.primary_score > baseline.primary_score` **by a meaningful
-  margin** — not within noise.
-- `model.max_drawdown ≤ baseline.max_drawdown + 0.05` — we allow a bit
-  more risk if the return justifies it, not much more.
-- `model.timeout_rate < 5%`.
-- The submitted code is readable enough to review and the signal has a
-  concrete, inspectable hypothesis.
+```bash
+python scripts/run_candidate.py --submission <path>/model_submission.py --duration 300
+```
 
-A submission **fails fast** if:
+Do not use the local path for untrusted submissions.
 
-- Scanner rejects the file.
-- Harness can't load `ModelSubmission`.
-- `on_tick` raises consistently.
-- `model.primary_score ≤ 0` after a full run (net loser).
-- `model.primary_score ≤ baseline.primary_score` (no edge).
+## Pending resolutions are not final
 
-## Things to look for in the code
+Short/demo runs should stop near the requested `--duration`; they do not wait
+for late Gamma settlement unless `--postmortem-timeout` is set. Official runs
+use a postmortem wait, but Gamma can still lag.
 
-- Is there a clear reason the signal should work? "Order book imbalance
-  predicts Polymarket mid-drift" is a testable hypothesis. "A neural net
-  learned the pattern" is not.
-- Do they acknowledge spread + slippage + fees? The default 0.5% per-order slippage
-  plus Polymarket's per-share taker fee adds up; a frequently-trading strategy
-  needs signal strong enough to overcome it.
-- Do they describe the failure mode? If BTC goes flat, what does their
-  signal do? How did they validate this?
-- Is the code readable? We read every line.
+If an official run exits with code `3` or `report.json` contains:
+
+```json
+"scoring_status": {"state": "pending_resolution"}
+```
+
+the score is not final and must not be accepted. Reconcile later:
+
+```bash
+python scripts/reconcile_resolutions.py \
+    --report runs/<candidate_id>/report.json \
+    --ticks runs/<candidate_id>/ticks.parquet
+```
+
+Repeat until `scoring_status.state` is `final`. The reconciliation command
+updates the settlement rows in `ticks.parquet`, event PnL in `report.json`,
+top-level final equity/PnL, metrics, and feed-health unknown counts. Use
+`--allow-pending` only for monitoring jobs that are expected to retry later.
+Use `--allow-unresolved-final` on the official runner only with an explicit
+reviewer decision to accept unresolved events.
+
+## Final validation
+
+After the run is final:
+
+```bash
+python scripts/validate_live_run.py \
+    --report runs/<candidate_id>/report.json \
+    --ticks runs/<candidate_id>/ticks.parquet \
+    --min-duration 7200 \
+    --min-events 20 \
+    --expect-price-source polymarket \
+    --max-clob-stale-count 0 \
+    --max-missing-book-fraction 0.20
+```
+
+For optional Binance mode, add `--require-binance --expect-price-source binance`.
+Do not pass `--allow-unknown` for accepted official scores.
+
+## Reproducibility metadata
+
+Every report includes a `metadata` block with:
+
+- candidate file path and SHA256
+- git commit SHA
+- Python and key package versions
+- exact command/config
+- container image and digest when provided by the runtime
+- price source, slippage, fee rate, starting capital, and duration
+- feed-health summary
+
+Keep the report and ticks together. The report is not enough to inspect
+per-tick behavior; the parquet is not enough to prove the exact command/config.
+
+## Scoring policy
+
+`report.json` has `model` and `baseline` blocks with the same schema. The
+primary score is:
+
+```text
+primary_score = pnl_total * max(sharpe, 0) * (1 - max_drawdown)
+```
+
+A submission passes only if, on the same live window:
+
+- `model.primary_score` beats `baseline.primary_score` by a meaningful margin
+- `model.max_drawdown <= baseline.max_drawdown + 0.05`
+- `model.timeout_rate < 5%`
+- the code is readable and the signal has a concrete hypothesis
+
+Fail fast if the scanner rejects the file, `ModelSubmission` cannot load,
+`on_tick` raises consistently, `model.primary_score <= 0`, or the model does
+not beat the baseline.
+
+Resolution PnL is reported separately from intra-event PnL. Strong trading
+models should make money by entering and exiting at good prices during the
+event, not only by carrying directional exposure to settlement. Review
+`resolution_pnl_fraction_abs` and `resolution_pnl_dominant_warning`; a high
+resolution fraction is a review warning even if the primary score is positive.
 
 ## Per-event inspection
 
-The harness writes `ticks.parquet` alongside `report.json` with both
-model and `baseline_*` columns. Open it:
+Open `ticks.parquet` alongside `report.json`:
 
 ```python
 import pandas as pd
+
 df = pd.read_parquet("runs/<candidate_id>/ticks.parquet")
-# Per-event equity trace for each track:
 for eid, g in df.groupby("event_id"):
     g = g.sort_values("ts")
     model_delta = g["equity"].iloc[-1] - g["equity"].iloc[0]
@@ -134,39 +195,16 @@ for eid, g in df.groupby("event_id"):
     print(eid, f"model:{model_delta:+.2f} base:{base_delta:+.2f}")
 ```
 
-Red flags while skimming:
-- Same signal every tick for hundreds of ticks → they're not reacting to
-  the market.
-- Signal flips every tick → overtrading, paying spread on every reversal.
-- `fills_this_tick` consistently == 0 even when signals change → book is
-  one-sided (see `BookTop.is_tradable`) or the target quantity delta is
-  sub-tick noise.
+Red flags:
 
-## When events aren't live
+- same signal every tick for hundreds of ticks
+- signal flips every tick and pays spread repeatedly
+- `fills_this_tick == 0` despite changing signals
+- nonzero PnL with `n_trades == 0`
+- report state is not `final`
 
-Polymarket's 5-min BTC series runs in bursts. If no live events are
-available during the scoring window:
+## When events are unavailable
 
-1. The candidate's run will log `no active BTC 5m event — waiting...`
-   repeatedly. PnL may be $0.
-2. Postpone the scoring run until the series resumes. Do not substitute
-   the replay fixture for official scoring.
-
-## Anti-exploitation checks
-
-The AST scanner is a screen, not a sandbox. The container command above is
-the untrusted-code boundary: it mounts only the candidate file and the run
-output directory, keeps the image filesystem read-only, limits memory/CPU/PIDs,
-and passes `--require-container` so `scripts/run_candidate.py` fails closed if
-someone accidentally runs it on the host. In addition:
-
-- Keep evaluator secrets out of the process environment. The runner scrubs
-  environment variables by default; use `--keep-env` only for local debugging.
-- Keep the default process limits unless intentionally debugging:
-  virtual memory 4 GB, max file size 1 GB, and max open files 256.
-- Run in a dedicated output directory; `MarketInfo.scratch_dir` is the only
-  filesystem path the model is told about.
-- After the run, grep the submitted file for any imports the scanner
-  might have missed.
-- Review `report.json` — `n_trades == 0` with nonzero `pnl_total` is a
-  red flag (possible simulator-state shenanigans).
+If the run logs repeated `no active BTC 5m event` messages and produces too few
+events or ticks, postpone scoring. Do not use replay fixtures, synthetic data,
+Gamma prices, Coinbase, Binance-US, or any other substitute for official PnL.

@@ -194,6 +194,9 @@ def test_replay_writes_dual_column_report_json(
     assert "baseline" in payload
     assert "metrics" in payload["model"]
     assert "metrics" in payload["baseline"]
+    assert payload["scoring_status"]["state"] == "final"
+    assert payload["metadata"]["runtime"]["packages"]["python"]
+    assert payload["metadata"]["execution"]["starting_capital"] == 1000.0
 
 
 def test_live_harness_drops_invalid_signal(tmp_path: Path) -> None:

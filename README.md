@@ -48,26 +48,25 @@ Then:
 
 ```bash
 # Replay against the committed fixture (offline, fast, deterministic)
-python replay.py --model polybench.baselines:MomentumBaseline \
+python replay.py --model-file examples/model_submission.py \
+    --class ModelSubmission \
     --data tests/fixtures/recorded_event.parquet
 
-# Run live against Polymarket (requires active BTC 5m events)
-python scripts/run_baseline.py --model momentum --duration 300
+# Run your submission live for a short local check
+python scripts/run_candidate.py \
+    --submission model_submission.py \
+    --duration 300 \
+    --output runs/my_local_check
 ```
 
-> **Live scoring is Polymarket-only.** The harness auto-discovers the
-> currently-trading 5-min BTC event every ~3 seconds by enumerating the
-> canonical slug `btc-updown-5m-<end_ts>` directly from Gamma. When one
-> event resolves it rolls straight to the next, chaining ~12 events per hour
-> during the scoring run. If discovery genuinely fails, the run fails —
-> there is no synthetic or cross-exchange fallback for PnL. Paper fills use
-> Polymarket CLOB `/book` data only; Gamma is used for event discovery and
-> resolution metadata, not for executable prices.
->
-> Completed events keep resolving in the background after rollover, so lagging
-> Polymarket settlement does not block the next market. Demo runs still stop
-> near the requested `--duration`; use `--postmortem-timeout` if you also want
-> to wait for a final in-flight event to resolve after the run window ends.
+Live runs discover the current BTC 5-minute event from Gamma, then stream
+Polymarket CLOB order books for fills and marks. Gamma is used for event
+discovery and final resolution metadata only. There is no synthetic price path
+and no Gamma executable-price fallback.
+
+By default `btc_last`, `btc_bid`, and `btc_ask` are zero because live runs are
+Polymarket-only. You may opt into the auxiliary Binance BTC feed locally with
+`--price-source binance`; fills and marks still come from Polymarket CLOB books.
 
 ---
 
@@ -113,8 +112,7 @@ Return `FLAT`, `None`, or a zero-size signal to close your position.
 
 Submit **exactly one file named `model_submission.py`**. It must define a
 class `ModelSubmission` that subclasses `polybench.Model`. File name and
-class name are fixed because the evaluator runs automation against those
-exact strings.
+class name are fixed because the runner loads those exact strings.
 
 Put your full model in that one file: state, feature logic, constants, and
 hyperparameters. Do not submit extra files, custom dependencies, data files,
@@ -213,7 +211,9 @@ resolves UP or DOWN.
 - `outcome_accuracy` — fraction of events where your resolution-PnL was
   positive.
 - `timeout_rate` — fraction of ticks where `on_tick` overran 500 ms.
-- PnL attribution — intra-event vs resolution split.
+- PnL attribution — intra-event vs resolution split. A warning flag is
+  recorded when almost all PnL comes from final settlement rather than
+  intra-event trading.
 
 ---
 
@@ -238,32 +238,21 @@ python scripts/run_baseline.py --duration 300
 # call (you ran the baseline as your "model") — that's by design.
 ```
 
-The official live path is **Polymarket-only by default**. It discovers the
+The live path is **Polymarket-only by default**. It discovers the
 active BTC 5-minute event from Gamma and streams Polymarket CLOB order books for
-fills and marks; it does not require Binance WebSockets. Evaluators can opt
-into an auxiliary BTC feed with `--price-source binance`. When this is
+fills and marks; it does not require Binance WebSockets. You can opt into an
+auxiliary BTC feed with `--price-source binance`. When this is
 enabled, recorded `ticks.parquet` rows contain both Polymarket UP/DOWN order-book fields and
-Binance BTC fields, with `btc_source` naming the active BTC feed. The live
-validator reports `polymarket_valid_rows`
-(active rows with usable UP/DOWN mids), `polymarket_two_sided_rows` (both
-bid and ask populated for both tokens), and `polymarket_one_sided_rows`
-(valid rows where one bid/ask is zero, which can happen near resolution).
+Binance BTC fields, with `btc_source` naming the active BTC feed.
 
-To run the dual-feed example live for a full scoring hour:
+To run the dual-feed example live:
 
 ```bash
 python scripts/run_candidate.py \
     --submission model_submissions/dual_feed_momentum/model_submission.py \
-    --duration 3600 \
+    --duration 300 \
     --price-source binance \
-    --output runs/live_1h_dual_feed
-
-python scripts/validate_live_run.py \
-    --report runs/live_1h_dual_feed/report.json \
-    --ticks runs/live_1h_dual_feed/ticks.parquet \
-    --min-duration 3600 \
-    --min-events 10 \
-    --require-binance
+    --output runs/live_dual_feed_check
 ```
 
 For a scanner-safe reference strategy matching the built-in benchmark, use
@@ -289,7 +278,7 @@ in replay will work live.
 
 The committed fixture is an offline regression aid with realistic synthesized
 Polymarket token prices. It exercises both UP-winning and DOWN-winning
-resolutions, but official scoring always happens live.
+resolutions, but scoring happens live.
 
 To record your own fresh fixture from live data:
 
@@ -332,7 +321,7 @@ investigate.
 A: For **scoring** yes — scoring happens only against the live market.
 For **fast iteration** use the committed replay fixture; everything that
 replays correctly will run correctly live. The fixture is not accepted as
-an official score.
+the scoring run.
 
 **Q: Can I call external APIs (exchange book depth, sentiment feeds)?**
 A: Yes, but from a background thread if they're slow. The 500 ms budget
@@ -360,7 +349,6 @@ A: No. Your submission is a single file. Don't touch `polybench/`.
 ```
 polymarket-btc-takehome/
 ├── README.md                     ← you are here
-├── EVALUATION.md                 ← evaluator-only scoring notes
 ├── pyproject.toml                ← hatchling, Python ≥ 3.11
 ├── requirements.txt              ← installed runtime dependencies
 ├── Dockerfile                    ← optional reproducibility
@@ -384,7 +372,7 @@ polymarket-btc-takehome/
 │   ├── run_candidate.py          ← scan → load → run (live)
 │   ├── scan_submission.py
 │   ├── record_fixture.py         ← record a live event
-│   └── synthesize_fixture.py     ← build fixture from BTC + synthetic PM
+│   └── synthesize_fixture.py     ← offline fixture helper
 ├── replay.py                     ← top-level alias for `polybench replay`
 └── tests/
     ├── test_pnl.py

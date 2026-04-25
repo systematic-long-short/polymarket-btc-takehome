@@ -111,6 +111,8 @@ def _cmd_run(args: argparse.Namespace) -> int:
         fee_rate=args.fee_rate,
         price_source=args.price_source,
         output_dir=Path(args.output_dir),
+        candidate_path=Path(args.model_file).resolve() if getattr(args, "model_file", None) else None,
+        command=tuple(sys.argv),
     )
     harness = Harness(model=model, config=cfg)
     result = asyncio.run(harness.run())

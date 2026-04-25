@@ -129,6 +129,8 @@ def summarize(
     reso = sum(e.pnl_resolution for e in events)
     denom = abs(intra) + abs(reso)
     intra_fraction = (intra / denom) if denom > 0 else 0.0
+    resolution_fraction = (abs(reso) / denom) if denom > 0 else 0.0
+    resolution_dominant = resolution_fraction >= 0.80 and abs(reso) > 0.0
     return {
         "starting_capital": starting_capital,
         "final_equity": final_equity,
@@ -146,5 +148,7 @@ def summarize(
         "pnl_intra_event": intra,
         "pnl_resolution": reso,
         "intra_vs_resolution_fraction": intra_fraction,  # 1 = all intra, -1 = all resolution
+        "resolution_pnl_fraction_abs": resolution_fraction,
+        "resolution_pnl_dominant_warning": resolution_dominant,
         "primary_score": primary_score,                  # PnL × max(Sharpe, 0) × (1 − max_drawdown)
     }

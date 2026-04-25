@@ -18,7 +18,6 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
-import dataclasses
 import json
 import logging
 import math
@@ -36,6 +35,11 @@ from polybench.model import FLAT, MarketInfo, Model, RunResult, Side, Signal, Ti
 from polybench.pnl import BookTop, PaperSimulator
 from polybench.pricefeed import PriceFeed
 from polybench.recorder import Recorder, TickRow
+from polybench.reporting import (
+    build_reproducibility_metadata,
+    event_dicts,
+    scoring_status,
+)
 
 log = logging.getLogger("polybench.harness")
 
@@ -69,6 +73,10 @@ class HarnessConfig:
     price_window_size: int = 300
     output_dir: Path = Path("runs/latest")
     series_slug: str = "btc-up-or-down-5m"
+    candidate_path: Path | None = None
+    command: tuple[str, ...] = ()
+    official_scoring: bool = False
+    allow_unresolved_final: bool = False
 
 
 class Harness:
@@ -128,6 +136,21 @@ class Harness:
         self._pending_signal: Signal | None = None
         self._baseline_pending_signal: Signal | None = None
         self._pending_resolution_events: dict[str, EventDescriptor] = {}
+        self._pending_resolution_since: dict[str, float] = {}
+        self._resolution_lags_s: list[float] = []
+        self._gamma_discovery_attempts = 0
+        self._gamma_discovery_failures = 0
+        self._gamma_discovery_empty = 0
+        self._gamma_resolution_attempts = 0
+        self._gamma_resolution_failures = 0
+        self._clob_ws_messages = 0
+        self._clob_ws_reconnects = 0
+        self._clob_ws_stale_count = 0
+        self._clob_last_message_ts = 0.0
+        self._missing_book_rows = 0
+        self._one_sided_book_rows = 0
+        self._two_sided_book_rows = 0
+        self._active_tick_rows = 0
 
     # ---- public ----
 
@@ -236,6 +259,9 @@ class Harness:
             except Exception as exc:  # noqa: BLE001
                 self._cached_up_book = None
                 self._cached_down_book = None
+                self._clob_ws_reconnects += 1
+                if "no CLOB WebSocket message" in str(exc):
+                    self._clob_ws_stale_count += 1
                 log.warning(
                     "CLOB WebSocket for %s stopped (%s); reconnecting in %.1fs",
                     event.slug,
@@ -294,18 +320,23 @@ class Harness:
             if not isinstance(msg, dict):
                 continue
             for token_id, book in _books_from_clob_ws_message(msg):
+                self._clob_ws_messages += 1
+                self._clob_last_message_ts = max(self._clob_last_message_ts, book.ts)
                 if token_id == event.up_token_id:
                     self._cached_up_book = book
                 elif token_id == event.down_token_id:
                     self._cached_down_book = book
 
     async def _discover_event(self, now: float) -> EventDescriptor | None:
+        self._gamma_discovery_attempts += 1
         try:
             event = await self._client.find_active_btc_event(now_ts=now)
         except Exception as exc:  # noqa: BLE001
+            self._gamma_discovery_failures += 1
             log.warning("gamma discovery failed: %s", exc)
             return None
         if event is None:
+            self._gamma_discovery_empty += 1
             log.info("no active BTC 5m event yet (probed next ~30min of boundaries) — waiting %.0fs",
                      EVENT_DISCOVERY_INTERVAL_S)
             return None
@@ -420,8 +451,10 @@ class Harness:
     ) -> tuple[float, float] | None:
         """Return final [1,0]/[0,1] prices once Gamma outcomePrices saturate."""
         try:
+            self._gamma_resolution_attempts += 1
             refreshed = await self._client.refresh_event(event.slug)
         except Exception as exc:  # noqa: BLE001
+            self._gamma_resolution_failures += 1
             log.warning("resolution refresh failed for %s: %s", event.slug, exc)
             return None
         if refreshed is None:
@@ -442,6 +475,9 @@ class Harness:
         event = self._pending_resolution_events.pop(slug, None)
         if event is None:
             return False
+        pending_since = self._pending_resolution_since.pop(slug, None)
+        if pending_since is not None:
+            self._resolution_lags_s.append(max(0.0, now - pending_since))
         model_result = self._simulator.settle_pending_event(slug, now, outcome[0], outcome[1])
         baseline_result = self._baseline_simulator.settle_pending_event(
             slug, now, outcome[0], outcome[1]
@@ -523,6 +559,7 @@ class Harness:
         self._recorder.record(row)
         if not resolved:
             self._pending_resolution_events[event.slug] = event
+            self._pending_resolution_since[event.slug] = now
         self._current_event = None
         self._cached_up_book = None
         self._cached_down_book = None
@@ -544,10 +581,16 @@ class Harness:
         assert self._current_event is not None
         if self._cached_up_book is None or self._cached_down_book is None:
             # No real CLOB books yet, so no model call or paper fill is recorded.
+            self._missing_book_rows += 1
             return
 
         up_book = self._cached_up_book
         down_book = self._cached_down_book
+        self._active_tick_rows += 1
+        if _is_two_sided_book(up_book) and _is_two_sided_book(down_book):
+            self._two_sided_book_rows += 1
+        else:
+            self._one_sided_book_rows += 1
         price_snap = self._pricefeed.snapshot()
 
         # Update 1 Hz rolling windows (one sample per tick so candidate models
@@ -743,24 +786,67 @@ class Harness:
                 "pnl_total": result.pnl_total,
                 "pnl_pct": result.pnl_pct,
                 "metrics": result.metrics,
-                "events": [
-                    dataclasses.asdict(e) if dataclasses.is_dataclass(e) else dict(e)
-                    for e in result.events
-                ],
+                "events": event_dicts(result.events),
             },
             "baseline": {
                 "final_equity": result.baseline_final_equity,
                 "pnl_total": result.baseline_pnl_total,
                 "pnl_pct": result.baseline_pnl_pct,
                 "metrics": result.baseline_metrics,
-                "events": [
-                    dataclasses.asdict(e) if dataclasses.is_dataclass(e) else dict(e)
-                    for e in result.baseline_events
-                ],
+                "events": event_dicts(result.baseline_events),
             },
         }
+        payload["scoring_status"] = scoring_status(
+            payload,
+            allow_unresolved=self._cfg.allow_unresolved_final,
+        )
+        payload["metadata"] = build_reproducibility_metadata(
+            candidate_path=self._cfg.candidate_path,
+            command=self._cfg.command,
+            config=self._cfg,
+            feed_health=self._feed_health_summary(result),
+        )
         report_path.write_text(json.dumps(payload, indent=2, default=_json_default))
         log.info("wrote %s", report_path)
+
+    def _feed_health_summary(self, result: RunResult) -> dict[str, Any]:
+        duration_s = max(0.0, result.ended_ts - result.started_ts)
+        unknown_events = sum(1 for event in result.events if event.resolved_outcome == "UNKNOWN")
+        active_rows = max(0, self._active_tick_rows)
+        return {
+            "price_source": self._cfg.price_source,
+            "duration_s": duration_s,
+            "active_tick_rows": active_rows,
+            "active_tick_coverage": (
+                active_rows / duration_s if duration_s > 0.0 else 0.0
+            ),
+            "clob_ws_messages": self._clob_ws_messages,
+            "clob_last_message_age_s": (
+                max(0.0, result.ended_ts - self._clob_last_message_ts)
+                if self._clob_last_message_ts > 0.0
+                else None
+            ),
+            "clob_ws_reconnects": self._clob_ws_reconnects,
+            "clob_ws_stale_count": self._clob_ws_stale_count,
+            "missing_book_rows": self._missing_book_rows,
+            "one_sided_book_rows": self._one_sided_book_rows,
+            "two_sided_book_rows": self._two_sided_book_rows,
+            "gamma_discovery_attempts": self._gamma_discovery_attempts,
+            "gamma_discovery_failures": self._gamma_discovery_failures,
+            "gamma_discovery_empty": self._gamma_discovery_empty,
+            "gamma_resolution_attempts": self._gamma_resolution_attempts,
+            "gamma_resolution_failures": self._gamma_resolution_failures,
+            "gamma_resolution_lag_max_s": max(self._resolution_lags_s)
+            if self._resolution_lags_s
+            else 0.0,
+            "gamma_resolution_lag_avg_s": (
+                sum(self._resolution_lags_s) / len(self._resolution_lags_s)
+                if self._resolution_lags_s
+                else 0.0
+            ),
+            "pending_resolution_events": len(self._pending_resolution_events),
+            "unknown_event_count": unknown_events,
+        }
 
 
 def _books_from_clob_ws_message(msg: dict[str, Any]) -> list[tuple[str, Book]]:
@@ -795,6 +881,10 @@ def _books_from_clob_ws_message(msg: dict[str, Any]) -> list[tuple[str, Book]]:
                 books.append((token_id, book))
         return books
     return []
+
+
+def _is_two_sided_book(book: Book) -> bool:
+    return book.best_bid > 0.0 and book.best_ask > 0.0
 
 
 def _book_from_levels(

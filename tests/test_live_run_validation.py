@@ -205,3 +205,32 @@ def test_validate_live_run_rejects_missing_polymarket_mids(
             min_events=2,
             require_binance=True,
         )
+
+
+def test_validate_live_run_rejects_pending_scoring_status(
+    synthetic_fixture: Path, tmp_path: Path
+) -> None:
+    report = tmp_path / "report.json"
+    ticks = tmp_path / "ticks.parquet"
+    _write_report(report)
+    payload = json.loads(report.read_text())
+    payload["scoring_status"] = {
+        "state": "pending_resolution",
+        "unresolved_event_count": 1,
+        "unresolved_events": [{"track": "model", "slug": "s", "event_id": "e"}],
+    }
+    report.write_text(json.dumps(payload))
+
+    df = pd.read_parquet(synthetic_fixture).iloc[:601].copy()
+    df["ts"] = [1_700_000_000.0 + i for i in range(len(df))]
+    df["btc_source"] = "binance"
+    df.to_parquet(ticks, engine="pyarrow", index=False)
+
+    with pytest.raises(AssertionError, match="pending_resolution"):
+        validate_live_run(
+            report_path=report,
+            ticks_path=ticks,
+            min_duration_s=600.0,
+            min_events=2,
+            require_binance=True,
+        )

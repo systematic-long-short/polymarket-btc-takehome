@@ -95,6 +95,10 @@ class EventResult:
     n_trades: int
     n_ticks: int
     n_timeouts: int
+    pending_resolution_up_shares: float = 0.0
+    pending_resolution_down_shares: float = 0.0
+    pending_resolution_up_mark: float = 0.0
+    pending_resolution_down_mark: float = 0.0
 
 
 @dataclass(frozen=True, slots=True)

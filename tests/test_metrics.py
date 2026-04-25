@@ -121,6 +121,8 @@ def test_summarize_keys_and_types() -> None:
     assert 0.0 <= m["max_drawdown"] <= 1.0
     assert m["n_events"] == 1
     assert m["hit_rate"] == 1.0
+    assert m["resolution_pnl_fraction_abs"] == pytest.approx(15.0 / 20.0)
+    assert m["resolution_pnl_dominant_warning"] is False
     # Primary score: PnL × max(Sharpe, 0) × (1 − max_drawdown).
     expected = m["pnl_total"] * m["sharpe"] * max(0.0, 1.0 - m["max_drawdown"])
     assert m["primary_score"] == pytest.approx(expected)
@@ -180,3 +182,14 @@ def test_primary_score_penalises_drawdown() -> None:
     # Drawdown penalty should produce a smaller primary_score for the volatile
     # track, even though PnL is identical.
     assert drawdown["primary_score"] < clean["primary_score"]
+
+
+def test_resolution_dominant_warning_flags_settlement_heavy_pnl() -> None:
+    m = summarize(
+        starting_capital=1000.0,
+        final_equity=1100.0,
+        equity_curve=[1000.0, 1050.0, 1100.0],
+        events=[_event(100.0, pnl_resolution=90.0, outcome="UP")],
+    )
+    assert m["resolution_pnl_fraction_abs"] == pytest.approx(0.90)
+    assert m["resolution_pnl_dominant_warning"] is True

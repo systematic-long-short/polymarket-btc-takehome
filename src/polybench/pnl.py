@@ -232,6 +232,10 @@ class PaperSimulator:
             n_trades=acc.n_trades,
             n_ticks=acc.n_ticks,
             n_timeouts=acc.n_timeouts,
+            pending_resolution_up_shares=held_up_shares if not resolved_known else 0.0,
+            pending_resolution_down_shares=held_down_shares if not resolved_known else 0.0,
+            pending_resolution_up_mark=acc.last_up_exit if not resolved_known else 0.0,
+            pending_resolution_down_mark=acc.last_down_exit if not resolved_known else 0.0,
         )
         self._completed_events.append(result)
         if not resolved_known:
@@ -283,6 +287,10 @@ class PaperSimulator:
             resolved_outcome=outcome,
             pnl_total=old.pnl_intra_event + resolution_pnl,
             pnl_resolution=resolution_pnl,
+            pending_resolution_up_shares=0.0,
+            pending_resolution_down_shares=0.0,
+            pending_resolution_up_mark=0.0,
+            pending_resolution_down_mark=0.0,
         )
         self._completed_events[pending.event_index] = updated
         return updated

@@ -64,6 +64,7 @@ def main(argv: list[str] | None = None) -> int:
         output_dir=out_dir,
         resolution_poll_timeout_s=args.resolution_timeout,
         postmortem_resolution_s=args.postmortem_timeout,
+        command=tuple(sys.argv if argv is None else [sys.argv[0], *argv]),
     )
     result = asyncio.run(Harness(model=model, config=cfg).run())
     print(format_summary(result))

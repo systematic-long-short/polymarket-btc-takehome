@@ -12,7 +12,7 @@ import json
 import logging
 import math
 from collections import deque
-from dataclasses import asdict, dataclass, is_dataclass
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
 
@@ -21,6 +21,7 @@ import pandas as pd
 from polybench.metrics import summarize
 from polybench.model import FLAT, MarketInfo, Model, RunResult, Side, Signal, Tick
 from polybench.pnl import BookTop, PaperSimulator
+from polybench.reporting import build_reproducibility_metadata, event_dicts, scoring_status
 
 log = logging.getLogger("polybench.replay")
 
@@ -256,18 +257,30 @@ def replay(
             "pnl_total": result.pnl_total,
             "pnl_pct": result.pnl_pct,
             "metrics": result.metrics,
-            "events": [asdict(e) if is_dataclass(e) else dict(e) for e in result.events],
+            "events": event_dicts(result.events),
         },
         "baseline": {
             "final_equity": result.baseline_final_equity,
             "pnl_total": result.baseline_pnl_total,
             "pnl_pct": result.baseline_pnl_pct,
             "metrics": result.baseline_metrics,
-            "events": [
-                asdict(e) if is_dataclass(e) else dict(e) for e in result.baseline_events
-            ],
+            "events": event_dicts(result.baseline_events),
         },
     }
+    payload["scoring_status"] = scoring_status(payload)
+    payload["metadata"] = build_reproducibility_metadata(
+        candidate_path=None,
+        command=None,
+        config=cfg,
+        feed_health={
+            "price_source": "recorded",
+            "duration_s": ended_ts - started_ts,
+            "active_tick_rows": int(len(df)),
+            "unknown_event_count": sum(
+                1 for event in result.events if event.resolved_outcome == "UNKNOWN"
+            ),
+        },
+    )
     report_path.write_text(json.dumps(payload, indent=2, default=str))
 
     if on_summary:

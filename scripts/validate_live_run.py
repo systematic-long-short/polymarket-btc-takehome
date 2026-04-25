@@ -81,9 +81,16 @@ def validate_live_run(
     min_events: int = 10,
     require_binance: bool = True,
     allow_unknown: bool = False,
+    expect_price_source: str | None = None,
+    max_clob_stale_count: int = 0,
+    max_missing_book_fraction: float = 0.20,
 ) -> dict[str, Any]:
     payload = json.loads(report_path.read_text())
     df = pd.read_parquet(ticks_path, engine="pyarrow")
+    scoring_status = payload.get("scoring_status", {})
+    scoring_state = str(scoring_status.get("state", "unknown"))
+    if not allow_unknown:
+        _require(scoring_state in {"final", "unknown"}, f"report scoring status is {scoring_state}")
 
     _require(not df.empty, "ticks parquet is empty")
     report_duration = float(payload["ended_ts"]) - float(payload["started_ts"])
@@ -134,9 +141,32 @@ def validate_live_run(
         _require(model["unknown_events"] == 0, "model has UNKNOWN events")
         _require(baseline["unknown_events"] == 0, "baseline has UNKNOWN events")
 
+    metadata = payload.get("metadata", {})
+    feed_health = metadata.get("feed_health", {}) if isinstance(metadata, dict) else {}
+    if expect_price_source is not None:
+        observed_source = str(feed_health.get("price_source") or payload.get("metadata", {}).get("execution", {}).get("price_source", ""))
+        _require(
+            observed_source == expect_price_source,
+            f"expected price_source={expect_price_source}, got {observed_source or '<missing>'}",
+        )
+    if feed_health:
+        stale_count = int(feed_health.get("clob_ws_stale_count", 0) or 0)
+        _require(
+            stale_count <= max_clob_stale_count,
+            f"CLOB WebSocket stale count {stale_count} exceeds {max_clob_stale_count}",
+        )
+        missing_rows = int(feed_health.get("missing_book_rows", 0) or 0)
+        active_rows = max(1, int(feed_health.get("active_tick_rows", len(active_df)) or 1))
+        missing_fraction = missing_rows / active_rows
+        _require(
+            missing_fraction <= max_missing_book_fraction,
+            f"missing book row fraction {missing_fraction:.2%} exceeds {max_missing_book_fraction:.2%}",
+        )
+
     return {
         "report": str(report_path),
         "ticks": str(ticks_path),
+        "scoring_status": scoring_state,
         "report_duration_s": report_duration,
         "tick_duration_s": tick_duration,
         "tick_rows": int(len(df)),
@@ -147,6 +177,7 @@ def validate_live_run(
         "polymarket_one_sided_rows": poly_one_sided_rows,
         "btc_complete_rows": btc_rows,
         "btc_sources": sources,
+        "feed_health": feed_health,
         "model": model,
         "baseline": baseline,
     }
@@ -160,6 +191,9 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--min-events", type=int, default=10)
     parser.add_argument("--require-binance", action="store_true")
     parser.add_argument("--allow-unknown", action="store_true")
+    parser.add_argument("--expect-price-source", choices=["polymarket", "binance"])
+    parser.add_argument("--max-clob-stale-count", type=int, default=0)
+    parser.add_argument("--max-missing-book-fraction", type=float, default=0.20)
     args = parser.parse_args(argv)
 
     summary = validate_live_run(
@@ -169,6 +203,9 @@ def main(argv: list[str] | None = None) -> int:
         min_events=args.min_events,
         require_binance=args.require_binance,
         allow_unknown=args.allow_unknown,
+        expect_price_source=args.expect_price_source,
+        max_clob_stale_count=args.max_clob_stale_count,
+        max_missing_book_fraction=args.max_missing_book_fraction,
     )
     print(json.dumps(summary, indent=2))
     return 0

@@ -109,6 +109,36 @@ def test_validate_live_run_accepts_dual_feed_tick_data(
     assert summary["model"]["primary_score"] == 194.0
 
 
+def test_validate_live_run_accepts_polymarket_only_tick_data(
+    synthetic_fixture: Path, tmp_path: Path
+) -> None:
+    report = tmp_path / "report.json"
+    ticks = tmp_path / "ticks.parquet"
+    _write_report(report)
+
+    df = pd.read_parquet(synthetic_fixture)
+    df = df.iloc[:601].copy()
+    df["ts"] = [1_700_000_000.0 + i for i in range(len(df))]
+    df["resolved_outcome"] = ""
+    df["btc_last"] = 0.0
+    df["btc_bid"] = 0.0
+    df["btc_ask"] = 0.0
+    df["btc_source"] = "polymarket"
+    df.to_parquet(ticks, engine="pyarrow", index=False)
+
+    summary = validate_live_run(
+        report_path=report,
+        ticks_path=ticks,
+        min_duration_s=600.0,
+        min_events=2,
+        require_binance=False,
+    )
+
+    assert summary["btc_complete_rows"] == 0
+    assert summary["btc_sources"] == ["polymarket"]
+    assert summary["polymarket_valid_rows"] == 601
+
+
 def test_validate_live_run_rejects_wrong_score(
     synthetic_fixture: Path, tmp_path: Path
 ) -> None:

@@ -2,7 +2,8 @@
 """Validate a live scoring run.
 
 This checks that the report score is internally correct and that the tick
-parquet contains both Polymarket token quotes and live Binance BTC data.
+parquet contains usable Polymarket token quotes. Binance BTC data is required
+only when ``--require-binance`` is set.
 """
 
 from __future__ import annotations
@@ -119,12 +120,12 @@ def validate_live_run(
     poly_one_sided_rows = poly_valid_rows - poly_two_sided_rows
     btc_rows = int(_positive_rows(active_df, btc_cols).sum())
     _require(poly_valid_rows >= min_ticks, "too few rows have valid Polymarket mids")
-    _require(btc_rows >= min_ticks, "too few rows have complete BTC quotes")
 
     sources: list[str] = []
     if "btc_source" in df.columns:
         sources = sorted(str(s) for s in df["btc_source"].dropna().unique())
     if require_binance:
+        _require(btc_rows >= min_ticks, "too few rows have complete BTC quotes")
         _require("btc_source" in df.columns, "ticks parquet lacks btc_source")
         binance_rows = int(df.loc[active_mask, "btc_source"].astype(str).str.startswith("binance").sum())
         _require(binance_rows >= min_ticks, "too few rows identify Binance as BTC source")

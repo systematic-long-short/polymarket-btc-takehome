@@ -105,6 +105,29 @@ def test_codecs_open_rejected() -> None:
     assert any(f.rule == "blocked_attr" for f in report.findings)
 
 
+def test_data_library_file_readers_are_rejected() -> None:
+    cases = [
+        "import pandas as pd\npd.read_table('/etc/passwd')",
+        "import pandas as pd\npd.read_excel('/tmp/book.xlsx')",
+        "import numpy as np\nnp.fromfile('/etc/passwd')",
+        "import polars as pl\npl.scan_ipc('/tmp/data.arrow')",
+        "from pandas import read_table as rt\nrt('/etc/passwd')",
+    ]
+    for src in cases:
+        report = scan_source(src)
+        assert report.verdict == "reject", report.format_text()
+        assert any(
+            f.rule in {"blocked_attr", "blocked_call", "blocked_name"}
+            for f in report.findings
+        )
+
+
+def test_harness_only_file_stack_not_candidate_allowlisted() -> None:
+    report = scan_source("import pyarrow")
+    assert report.verdict == "reject"
+    assert any(f.rule == "unknown_import" for f in report.findings)
+
+
 def test_common_string_replace_is_allowed() -> None:
     report = scan_source("x = 'BTC-USD'.replace('-', '')")
     assert report.verdict == "accept", report.format_text()

@@ -1,7 +1,7 @@
-# polybench — pre-vetted dependency allowlist.
-# Candidates may import ANY package listed here plus Python stdlib.
-# Candidates may NOT ship their own requirements.txt — the security scanner
-# rejects any import not on this list.
+# polybench runtime dependencies.
+# The candidate import allowlist is documented in README.md and enforced by
+# src/polybench/submission_scan.py. Harness-only packages in this file, such
+# as pyarrow and pytest, are not necessarily valid candidate imports.
 #
 # Install with:   pip install -r requirements.txt
 # Heavy install (torch + tensorflow CPU wheels ≈ 1–2 GB). Use a dedicated venv.

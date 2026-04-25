@@ -9,7 +9,7 @@ produces under current conditions.
 
 Example:
     python scripts/run_baseline.py --duration 300
-    python scripts/run_baseline.py --duration 3600 --config configs/demo_momentum.json
+    python scripts/run_baseline.py --duration 3600
 """
 
 from __future__ import annotations
@@ -39,6 +39,18 @@ def main(argv: list[str] | None = None) -> int:
                    help="Default 'polymarket' disables external BTC WebSockets.")
     p.add_argument("--output-dir", default=None)
     p.add_argument("--config", default=None)
+    p.add_argument(
+        "--resolution-timeout",
+        type=float,
+        default=45.0,
+        help="Seconds to wait for a just-ended event to resolve before marking UNKNOWN.",
+    )
+    p.add_argument(
+        "--postmortem-timeout",
+        type=float,
+        default=0.0,
+        help="Extra seconds after the run to refresh UNKNOWN resolutions (default 0).",
+    )
     args = p.parse_args(argv)
 
     model = MomentumBaseline(config=_load_config(args.config))
@@ -50,6 +62,8 @@ def main(argv: list[str] | None = None) -> int:
         fee_rate=args.fee_rate,
         price_source=args.price_source,
         output_dir=out_dir,
+        resolution_poll_timeout_s=args.resolution_timeout,
+        postmortem_resolution_s=args.postmortem_timeout,
     )
     result = asyncio.run(Harness(model=model, config=cfg).run())
     print(format_summary(result))

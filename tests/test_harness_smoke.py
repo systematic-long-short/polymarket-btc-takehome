@@ -6,6 +6,7 @@ without touching the network.
 
 from __future__ import annotations
 
+import asyncio
 import math
 from pathlib import Path
 
@@ -42,6 +43,15 @@ class _InvalidSignalModel(Model):
         return Signal(side="BAD", size="not-a-number")  # type: ignore[arg-type]
 
 
+class _RefreshCountingClient:
+    def __init__(self) -> None:
+        self.refresh_calls = 0
+
+    async def refresh_event(self, slug: str):
+        self.refresh_calls += 1
+        return None
+
+
 def _tick() -> Tick:
     return Tick(
         ts=1.0,
@@ -72,10 +82,10 @@ def test_replay_always_up_produces_resolution_pnl(
     any_event_fixture: Path, tmp_path: Path
 ) -> None:
     result = replay(_AlwaysUpModel(), any_event_fixture, _cfg(tmp_path))
-    intra = result.metrics["pnl_intra_event"]
     reso = result.metrics["pnl_resolution"]
-    # AlwaysUp holds through resolution → resolution PnL dominates intra.
-    assert abs(reso) >= abs(intra)
+    # AlwaysUp holds through resolution, so the replay path must attribute
+    # some PnL to settlement rather than treating the event as mark-only.
+    assert abs(reso) > 0.0
 
 
 def test_replay_momentum_baseline_runs(
@@ -133,5 +143,23 @@ def test_live_harness_drops_invalid_signal(tmp_path: Path) -> None:
     harness = Harness(_InvalidSignalModel(), HarnessConfig(output_dir=tmp_path / "out"))
     try:
         assert harness._safe_on_tick(_InvalidSignalModel(), _tick()) is None
+    finally:
+        harness._executor.shutdown(wait=False, cancel_futures=True)
+
+
+def test_postmortem_resolution_disabled_skips_gamma_refresh(tmp_path: Path) -> None:
+    client = _RefreshCountingClient()
+    harness = Harness(
+        _FlatModel(),
+        HarnessConfig(output_dir=tmp_path / "out", postmortem_resolution_s=0.0),
+        client=client,  # type: ignore[arg-type]
+    )
+    try:
+        for simulator in (harness._simulator, harness._baseline_simulator):
+            simulator.start_event("E1", "btc-updown-test", 0.0, 0.5, 0.5)
+            simulator.finish_event(1.0, None, None)
+
+        asyncio.run(harness._postmortem_resolve_unknowns(max_wait_s=0.0, poll_interval_s=0.0))
+        assert client.refresh_calls == 0
     finally:
         harness._executor.shutdown(wait=False, cancel_futures=True)

@@ -1,5 +1,7 @@
 FROM python:3.11-slim
 
+ENV PYTHONDONTWRITEBYTECODE=1
+
 WORKDIR /polybench
 
 # Layer heavy deps first for better cache reuse on candidate iteration.

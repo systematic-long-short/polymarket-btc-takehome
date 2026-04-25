@@ -7,7 +7,7 @@ don't have internet access to Polymarket.
 
     Scoring is performed EXCLUSIVELY against the live Polymarket market by
     `scripts/run_baseline.py` / `scripts/run_candidate.py`. The output of
-    this script is never accepted as scoring evidence. See EVALUATION.md.
+    this script is never accepted as an official score. See EVALUATION.md.
 
 Captures real BTC prices from the Binance WebSocket over the requested
 duration, then synthesizes Polymarket UP/DOWN token prices whose mid

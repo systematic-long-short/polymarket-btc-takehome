@@ -61,6 +61,10 @@ python scripts/run_baseline.py --model momentum --duration 300
 > event resolves it rolls straight to the next, chaining ~12 events per hour
 > during the scoring run. If discovery genuinely fails, the run fails —
 > there is no synthetic or cross-exchange fallback for PnL.
+>
+> Demo runs stop near the requested `--duration`. If the final event has not
+> resolved yet, it is reported as `UNKNOWN` rather than waiting minutes after
+> a short smoke test.
 
 ---
 
@@ -104,22 +108,14 @@ Return `FLAT`, `None`, or a zero-size signal to close your position.
 
 ## What you submit
 
-1. **Exactly one file named `model_submission.py`** at the top of your
-   submission directory. It must define a class `ModelSubmission` that
-   subclasses `polybench.Model`. File name and class name are both
-   **fixed** — the evaluator runs automation against those exact strings.
+Submit **exactly one file named `model_submission.py`**. It must define a
+class `ModelSubmission` that subclasses `polybench.Model`. File name and
+class name are fixed because the evaluator runs automation against those
+exact strings.
 
-2. **`WRITEUP.md`** (required, <1 page). Answer:
-   - What's the intuition / hypothesis?
-   - What data did you use, and how did you preprocess it?
-   - How does the signal compute a side + size?
-   - What would you do with more time?
-
-3. **`config.json`** (optional). Hyperparameters your model reads via
-   `self.config` in `__init__`.
-
-**We do NOT accept a candidate `requirements.txt`.** The repo already
-installs everything you're allowed to use — see the next section.
+Put your full model in that one file: state, feature logic, constants, and
+hyperparameters. Do not submit extra files, custom dependencies, data files,
+or harness changes.
 
 ---
 
@@ -139,9 +135,9 @@ Your submission may import only:
 * **Technical indicators:** `ta`
 * **Harness APIs you can import:** `polybench`, `httpx`, `websockets`
 
-If you need a library that's not on this list, **ask before submitting**.
-An unknown import is treated as a failed submission — the security
-scanner rejects it statically.
+Data libraries are available for in-memory computation. Their direct file
+readers/writers, such as `pandas.read_*`, `numpy.fromfile`, and
+`polars.scan_*`, are rejected. Unknown imports are also rejected.
 
 ---
 
@@ -157,8 +153,7 @@ scanner rejects it statically.
   500 ms budget. For slow external feeds, start a background thread in
   `on_start` and read cached state from `on_tick` — see the template for
   the pattern.
-- **No direct filesystem or environment access.** The evaluator passes your
-  optional `config.json` through `self.config`; do not read files or
+- **No direct filesystem or environment access.** Do not read files or
   environment variables from the submission. No subprocesses. No reading
   forward-looking data (the resolution price is not exposed — don't go
   looking for it in Gamma either).
@@ -226,8 +221,8 @@ apples-to-apples per second.
 
 - `MomentumBaseline` — 30-second BTC momentum → UP / DOWN / FLAT with
   magnitude-scaled size, trades dynamically within each event. This is
-  THE BAR. To pass, your submission must materially beat it on the
-  primary score.
+  the shipped example to beat. Strong submissions should materially
+  outperform it on the primary score.
 
 Run the baseline solo to see what "the bar" is producing under current
 market conditions:
@@ -289,7 +284,7 @@ in replay will work live.
 
 The committed fixture is an offline regression aid with realistic synthesized
 Polymarket token prices. It exercises both UP-winning and DOWN-winning
-resolutions, but it is not scoring evidence.
+resolutions, but official scoring always happens live.
 
 To record your own fresh fixture from live data:
 
@@ -309,7 +304,7 @@ used for scoring. See the banner in that file.
 ## Time expectation
 
 **3 days max.** If you're grinding into day 4, something's off with your
-approach — tell us in the writeup.
+approach.
 
 ---
 
@@ -332,7 +327,7 @@ investigate.
 A: For **scoring** yes — scoring happens only against the live market.
 For **fast iteration** use the committed replay fixture; everything that
 replays correctly will run correctly live. The fixture is not accepted as
-scoring evidence.
+an official score.
 
 **Q: Can I call external APIs (exchange book depth, sentiment feeds)?**
 A: Yes, but from a background thread if they're slow. The 500 ms budget
@@ -348,10 +343,6 @@ Any shares still held at event end are settled against that event's final
 want to avoid resolution exposure, emit `FLAT` when `tick.time_to_resolve`
 drops near zero.
 
-**Q: I want to use a library that's not on the list.**
-A: Email us before submitting. The security scanner will reject unknown
-imports.
-
 **Q: Can I modify the harness code?**
 A: No. Your submission is a single file. Don't touch `polybench/`.
 
@@ -364,7 +355,7 @@ polymarket-btc-takehome/
 ├── README.md                     ← you are here
 ├── EVALUATION.md                 ← evaluator-only scoring notes
 ├── pyproject.toml                ← hatchling, Python ≥ 3.11
-├── requirements.txt              ← the full candidate dependency allowlist
+├── requirements.txt              ← installed runtime dependencies
 ├── Dockerfile                    ← optional reproducibility
 ├── src/polybench/
 │   ├── __init__.py               ← re-exports Model, Tick, Signal, ...

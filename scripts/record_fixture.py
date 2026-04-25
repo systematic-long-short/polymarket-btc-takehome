@@ -37,6 +37,18 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--price-source", default="polymarket",
                    choices=["polymarket", "binance", "binance-us", "coinbase"],
                    help="Default 'polymarket' records Polymarket only.")
+    p.add_argument(
+        "--resolution-timeout",
+        type=float,
+        default=45.0,
+        help="Seconds to wait for a just-ended event to resolve before marking UNKNOWN.",
+    )
+    p.add_argument(
+        "--postmortem-timeout",
+        type=float,
+        default=0.0,
+        help="Extra seconds after the run to refresh UNKNOWN resolutions (default 0).",
+    )
     args = p.parse_args(argv)
 
     run_dir = Path(f"runs/record_fixture_tmp")
@@ -48,6 +60,8 @@ def main(argv: list[str] | None = None) -> int:
         duration_s=args.duration,
         price_source=args.price_source,
         output_dir=run_dir,
+        resolution_poll_timeout_s=args.resolution_timeout,
+        postmortem_resolution_s=args.postmortem_timeout,
     )
     result = asyncio.run(Harness(model=_NoopModel(), config=cfg).run())
     print(format_summary(result))

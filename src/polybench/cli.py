@@ -104,6 +104,8 @@ def _cmd_run(args: argparse.Namespace) -> int:
         duration_s=args.duration,
         tick_interval_s=args.tick_interval,
         model_budget_s=args.model_budget,
+        resolution_poll_timeout_s=args.resolution_timeout,
+        postmortem_resolution_s=args.postmortem_timeout,
         starting_capital=args.starting_capital,
         slippage_bps=args.slippage_bps,
         fee_rate=args.fee_rate,
@@ -154,6 +156,18 @@ def build_parser() -> argparse.ArgumentParser:
     r.add_argument("--duration", type=float, default=3600.0, help="Run duration in seconds")
     r.add_argument("--tick-interval", type=float, default=1.0)
     r.add_argument("--model-budget", type=float, default=0.5, help="on_tick wall-clock budget (s)")
+    r.add_argument(
+        "--resolution-timeout",
+        type=float,
+        default=45.0,
+        help="Seconds to wait for a just-ended event to resolve before marking UNKNOWN.",
+    )
+    r.add_argument(
+        "--postmortem-timeout",
+        type=float,
+        default=0.0,
+        help="Extra seconds after the run to refresh UNKNOWN resolutions (default 0).",
+    )
     r.add_argument("--starting-capital", type=float, default=1000.0)
     r.add_argument("--slippage-bps", type=float, default=50.0, help="Default 50 = 0.5%% per order")
     r.add_argument("--fee-rate", type=float, default=0.072,

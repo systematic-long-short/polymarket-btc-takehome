@@ -24,14 +24,13 @@ from typing import Iterable
 
 # ----- policy -----
 
-# Harness + third-party (must stay in sync with requirements.txt).
+# Candidate-facing third-party imports. Harness-only runtime dependencies
+# can exist in requirements.txt without being valid submission imports.
 THIRD_PARTY_ALLOWED: frozenset[str] = frozenset({
     # harness
     "polybench",
     "httpx",
     "websockets",
-    "pyarrow",
-    "pytest",
     # numerical / data
     "numpy",
     "pandas",
@@ -178,25 +177,60 @@ BLOCKED_ATTR_PATHS: frozenset[str] = frozenset({
     "io.open",
     "lzma.open",
     "numpy.load",
+    "numpy.loadtxt",
+    "numpy.genfromtxt",
+    "numpy.fromfile",
+    "numpy.fromregex",
     "numpy.memmap",
     "numpy.save",
     "numpy.savez",
     "numpy.savetxt",
+    "numpy.DataSource",
+    "numpy.lib.npyio.DataSource",
     "operator.attrgetter",
     "operator.methodcaller",
+    "pandas.ExcelFile",
+    "pandas.HDFStore",
     "pandas.read_csv",
+    "pandas.read_clipboard",
+    "pandas.read_excel",
+    "pandas.read_feather",
+    "pandas.read_fwf",
+    "pandas.read_gbq",
+    "pandas.read_hdf",
+    "pandas.read_html",
     "pandas.read_json",
+    "pandas.read_orc",
     "pandas.read_parquet",
     "pandas.read_pickle",
-    "pandas.read_feather",
+    "pandas.read_sas",
     "pandas.read_sql",
+    "pandas.read_spss",
+    "pandas.read_stata",
+    "pandas.read_table",
+    "pandas.read_xml",
     "polars.read_csv",
+    "polars.read_database",
+    "polars.read_delta",
+    "polars.read_excel",
+    "polars.read_ipc",
+    "polars.read_ndjson",
     "polars.read_json",
     "polars.read_parquet",
-    "polars.read_database",
     "polars.scan_csv",
+    "polars.scan_delta",
+    "polars.scan_iceberg",
+    "polars.scan_ipc",
+    "polars.scan_ndjson",
     "polars.scan_parquet",
+    "polars.scan_pyarrow_dataset",
 })
+
+BLOCKED_ATTR_PREFIXES: tuple[str, ...] = (
+    "pandas.read_",
+    "polars.read_",
+    "polars.scan_",
+)
 
 BLOCKED_ATTR_NAMES: frozenset[str] = frozenset({
     # Filesystem methods on pathlib objects and file-like helpers. The scanner
@@ -344,6 +378,12 @@ def _attr_path(node: ast.AST) -> str | None:
     return None
 
 
+def _is_blocked_attr_path(path: str) -> bool:
+    return path in BLOCKED_ATTR_PATHS or any(
+        path.startswith(prefix) for prefix in BLOCKED_ATTR_PREFIXES
+    )
+
+
 class _Visitor(ast.NodeVisitor):
     def __init__(self) -> None:
         self.findings: list[Finding] = []
@@ -430,7 +470,7 @@ class _Visitor(ast.NodeVisitor):
                     rule="blocked_call",
                     message=f"call to blocked builtin {func.id!r}",
                 )
-            elif normalized_name in BLOCKED_ATTR_PATHS:
+            elif _is_blocked_attr_path(normalized_name):
                 self._add(
                     node,
                     severity="critical",
@@ -443,7 +483,7 @@ class _Visitor(ast.NodeVisitor):
     def visit_Attribute(self, node: ast.Attribute) -> None:
         raw_path = _attr_path(node)
         path = self._normalize_path(raw_path) if raw_path is not None else None
-        if path is not None and path in BLOCKED_ATTR_PATHS:
+        if path is not None and _is_blocked_attr_path(path):
             self._add(
                 node,
                 severity="critical",
@@ -483,7 +523,7 @@ class _Visitor(ast.NodeVisitor):
                     rule="blocked_name",
                     message=f"reference to blocked builtin {node.id!r}",
                 )
-            elif normalized_name in BLOCKED_ATTR_PATHS:
+            elif _is_blocked_attr_path(normalized_name):
                 self._add(
                     node,
                     severity="critical",

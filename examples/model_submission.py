@@ -16,8 +16,9 @@ from typing import Any
 # `polybench` is installed via `pip install -e .` in the repo root.
 from polybench import FLAT, MarketInfo, Model, RunResult, Side, Signal, Tick
 
-# You can import ANY library listed in requirements.txt plus Python stdlib.
-# The security scanner will reject unknown imports.
+# You can import the libraries listed in README.md plus the documented
+# safe standard-library subset. The security scanner rejects unknown imports
+# and direct file/environment/subprocess access.
 #
 # Example allowed imports:
 #   import numpy as np
@@ -61,8 +62,8 @@ class ModelSubmission(Model):
 
     def __init__(self, config: dict[str, Any] | None = None) -> None:
         super().__init__(config=config)
-        # TODO: read your hyperparameters from self.config.
-        # Example: self._lookback = int(self.config.get("lookback_s", 30))
+        # TODO: set your hyperparameters here.
+        # Example: self._lookback = 30
         self._btc_window: deque[float] = deque(maxlen=600)   # 10 min @ 1 Hz
         self._up_window: deque[float] = deque(maxlen=600)
 

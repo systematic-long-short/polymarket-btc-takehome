@@ -53,6 +53,9 @@ class HarnessConfig:
     tick_interval_s: float = DEFAULT_TICK_INTERVAL_S
     model_budget_s: float = DEFAULT_MODEL_BUDGET_S
     clob_poll_interval_s: float = DEFAULT_CLOB_POLL_INTERVAL_S
+    resolution_poll_timeout_s: float = RESOLUTION_POLL_TIMEOUT_S
+    postmortem_resolution_s: float = 0.0
+    postmortem_poll_interval_s: float = 10.0
     starting_capital: float = 1000.0
     slippage_bps: float = 50.0
     fee_rate: float = 0.072   # Polymarket-style per-trade fee coefficient
@@ -138,7 +141,10 @@ class Harness:
             # one last Gamma refresh — Polymarket sometimes lags the resolution
             # flip by a few minutes, and this catches them without blocking the
             # event rollover during the run.
-            await self._postmortem_resolve_unknowns()
+            await self._postmortem_resolve_unknowns(
+                max_wait_s=self._cfg.postmortem_resolution_s,
+                poll_interval_s=self._cfg.postmortem_poll_interval_s,
+            )
             if self._own_pricefeed:
                 await self._pricefeed.stop()
             if self._own_client:
@@ -338,6 +344,9 @@ class Harness:
         """
         import dataclasses as _dc
 
+        if max_wait_s <= 0.0:
+            return
+
         model_events = self._simulator._completed_events
         baseline_events = self._baseline_simulator._completed_events
         if not model_events and not baseline_events:
@@ -393,7 +402,10 @@ class Harness:
                 }
                 if not remaining:
                     break
-                await asyncio.sleep(poll_interval_s)
+                remaining_wait = deadline - time.time()
+                if remaining_wait <= 0.0:
+                    break
+                await asyncio.sleep(min(poll_interval_s, remaining_wait))
         if total_upgraded:
             log.info("postmortem: upgraded %d UNKNOWN event rows", total_upgraded)
 
@@ -403,7 +415,8 @@ class Harness:
         """Poll the same Gamma slug until ``closed=true`` and outcomePrices
         saturate to [1,0] or [0,1]. No cross-source fallback — if Polymarket
         hasn't resolved within the timeout, return ``None`` (UNKNOWN)."""
-        deadline = time.time() + RESOLUTION_POLL_TIMEOUT_S
+        timeout_s = max(0.0, self._cfg.resolution_poll_timeout_s)
+        deadline = time.time() + timeout_s
         while time.time() < deadline and not self._stop.is_set():
             try:
                 refreshed = await self._client.refresh_event(event.slug)
@@ -427,7 +440,7 @@ class Harness:
         log.warning(
             "event %s did not resolve within %.0fs — closing with UNKNOWN outcome",
             event.slug,
-            RESOLUTION_POLL_TIMEOUT_S,
+            timeout_s,
         )
         return None
 
@@ -784,12 +797,16 @@ async def run_model(
     price_source: str = "polymarket",
     tick_interval_s: float = DEFAULT_TICK_INTERVAL_S,
     model_budget_s: float = DEFAULT_MODEL_BUDGET_S,
+    resolution_poll_timeout_s: float = RESOLUTION_POLL_TIMEOUT_S,
+    postmortem_resolution_s: float = 0.0,
     on_summary: Callable[[str], None] | None = None,
 ) -> RunResult:
     cfg = HarnessConfig(
         duration_s=duration_s,
         tick_interval_s=tick_interval_s,
         model_budget_s=model_budget_s,
+        resolution_poll_timeout_s=resolution_poll_timeout_s,
+        postmortem_resolution_s=postmortem_resolution_s,
         starting_capital=starting_capital,
         slippage_bps=slippage_bps,
         price_source=price_source,

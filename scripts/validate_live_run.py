@@ -1,9 +1,8 @@
 #!/usr/bin/env python
 """Validate a live scoring run.
 
-This is intended for post-run evidence, not for synthetic scoring. It checks
-that the report score is internally correct and that the tick parquet contains
-both Polymarket token quotes and live Binance BTC data.
+This checks that the report score is internally correct and that the tick
+parquet contains both Polymarket token quotes and live Binance BTC data.
 """
 
 from __future__ import annotations

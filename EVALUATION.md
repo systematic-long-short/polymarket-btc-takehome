@@ -3,8 +3,8 @@
 Internal. Not distributed to candidates; candidates see `README.md`.
 
 > **Scoring runs land only against live Polymarket. There is no accepted
-> substitute.** Replay against the committed fixture is *iteration aid*, not
-> scoring evidence. If the scoring window has a network or Polymarket
+> substitute.** Replay against the committed fixture is an iteration aid, not
+> a scoring input. If the scoring window has a network or Polymarket
 > outage, pause the run and restart — do NOT fall back to the fixture or to
 > any other price source for PnL.
 
@@ -23,15 +23,30 @@ Polymarket Gamma/CLOB availability.
 # Set up a fresh working dir per candidate.
 mkdir -p runs/<candidate_id>
 
-# 1. Scan. Must return "accept" (exit 0). If not — reject.
+# 1. Scan. Must return "accept" (exit 0). If not, reject.
 python scripts/scan_submission.py --file <submission>/model_submission.py
 
-# 2. Run candidate live. Baseline runs alongside automatically.
-python scripts/run_candidate.py \
-    --submission <submission>/model_submission.py \
-    --config <submission>/config.json \         # optional
-    --duration 7200 \
-    --output runs/<candidate_id>/
+# 2. Build the evaluator image once per repo revision.
+docker build -t polybench-eval .
+
+# 3. Run candidate live inside a container. Baseline runs alongside automatically.
+docker run --rm \
+    --entrypoint python \
+    --network bridge \
+    --cpus 2 \
+    --memory 4g \
+    --pids-limit 256 \
+    --read-only \
+    --tmpfs /tmp:rw,noexec,nosuid,nodev,size=128m \
+    -v "$(realpath <submission>/model_submission.py):/submission/model_submission.py:ro" \
+    -v "$(pwd)/runs/<candidate_id>:/runs/<candidate_id>" \
+    polybench-eval \
+    scripts/run_candidate.py \
+        --submission /submission/model_submission.py \
+        --duration 7200 \
+        --output /runs/<candidate_id> \
+        --require-container \
+        --postmortem-timeout 600
 ```
 
 ## Metrics in `report.json`
@@ -75,8 +90,8 @@ from the candidate's `report.json`):
 - `model.max_drawdown ≤ baseline.max_drawdown + 0.05` — we allow a bit
   more risk if the return justifies it, not much more.
 - `model.timeout_rate < 5%`.
-- The writeup articulates a real hypothesis, not "I tried some ML and
-  it learned something."
+- The submitted code is readable enough to review and the signal has a
+  concrete, inspectable hypothesis.
 
 A submission **fails fast** if:
 
@@ -85,11 +100,10 @@ A submission **fails fast** if:
 - `on_tick` raises consistently.
 - `model.primary_score ≤ 0` after a full run (net loser).
 - `model.primary_score ≤ baseline.primary_score` (no edge).
-- No writeup submitted.
 
-## Things to look for in the writeup
+## Things to look for in the code
 
-- Do they explain WHY their signal should work? "Order book imbalance
+- Is there a clear reason the signal should work? "Order book imbalance
   predicts Polymarket mid-drift" is a testable hypothesis. "A neural net
   learned the pattern" is not.
 - Do they acknowledge spread + slippage + fees? The default 0.5% per-order slippage
@@ -135,15 +149,17 @@ available during the scoring window:
 
 ## Anti-exploitation checks
 
-The AST scanner is a screen, not a sandbox. For scoring use
-`scripts/run_candidate.py`, which also applies best-effort process hardening
-before importing the candidate module. In addition:
+The AST scanner is a screen, not a sandbox. The container command above is
+the untrusted-code boundary: it mounts only the candidate file and the run
+output directory, keeps the image filesystem read-only, limits memory/CPU/PIDs,
+and passes `--require-container` so `scripts/run_candidate.py` fails closed if
+someone accidentally runs it on the host. In addition:
 
 - Keep evaluator secrets out of the process environment. The runner scrubs
   environment variables by default; use `--keep-env` only for local debugging.
 - Keep the default process limits unless intentionally debugging:
   virtual memory 4 GB, max file size 1 GB, and max open files 256.
-- Run in a dedicated working directory; `MarketInfo.scratch_dir` is the only
+- Run in a dedicated output directory; `MarketInfo.scratch_dir` is the only
   filesystem path the model is told about.
 - After the run, grep the submitted file for any imports the scanner
   might have missed.

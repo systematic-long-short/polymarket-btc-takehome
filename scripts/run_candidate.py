@@ -36,6 +36,18 @@ SAFE_ENV_KEYS = frozenset({
 })
 
 
+def _running_in_container() -> bool:
+    """Best-effort check used by evaluator automation before importing code."""
+    if Path("/.dockerenv").exists():
+        return True
+    try:
+        cgroup = Path("/proc/1/cgroup").read_text()
+    except OSError:
+        return False
+    markers = ("docker", "containerd", "kubepods", "podman")
+    return any(marker in cgroup for marker in markers)
+
+
 def _scrub_environment() -> None:
     """Remove evaluator secrets before importing untrusted candidate code."""
     preserved = {k: v for k, v in os.environ.items() if k in SAFE_ENV_KEYS}
@@ -102,6 +114,18 @@ def main(argv: list[str] | None = None) -> int:
                    help="Default 'polymarket' disables external BTC WebSockets.")
     p.add_argument("--output", dest="output_dir", default=None)
     p.add_argument("--config", default=None)
+    p.add_argument(
+        "--resolution-timeout",
+        type=float,
+        default=45.0,
+        help="Seconds to wait for a just-ended event to resolve before marking UNKNOWN.",
+    )
+    p.add_argument(
+        "--postmortem-timeout",
+        type=float,
+        default=0.0,
+        help="Extra seconds after the run to refresh UNKNOWN resolutions (default 0).",
+    )
     p.add_argument("--memory-mb", type=int, default=4096,
                    help="Best-effort process virtual memory cap for the candidate run.")
     p.add_argument("--file-size-mb", type=int, default=1024,
@@ -115,11 +139,27 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="Load the submission even if the scanner rejects it (debug-only).",
     )
+    p.add_argument(
+        "--require-container",
+        action="store_true",
+        help=(
+            "Fail unless the runner appears to be inside Docker/Podman/Kubernetes. "
+            "Use this for evaluator automation with untrusted submissions."
+        ),
+    )
     args = p.parse_args(argv)
 
     path = Path(args.submission).resolve()
     if not path.is_file():
         print(f"ERROR: submission file not found: {path}", file=sys.stderr)
+        return 2
+    if args.require_container and not _running_in_container():
+        print(
+            "ERROR: refusing to import an untrusted submission outside a container. "
+            "Run the evaluator command from EVALUATION.md, or omit "
+            "--require-container only for trusted local debugging.",
+            file=sys.stderr,
+        )
         return 2
 
     print(f"scanning {path}...")
@@ -152,6 +192,8 @@ def main(argv: list[str] | None = None) -> int:
         fee_rate=args.fee_rate,
         price_source=args.price_source,
         output_dir=out_dir,
+        resolution_poll_timeout_s=args.resolution_timeout,
+        postmortem_resolution_s=args.postmortem_timeout,
     )
     result = asyncio.run(Harness(model=model, config=cfg).run())
     print(format_summary(result))

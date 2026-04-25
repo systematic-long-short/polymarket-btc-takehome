@@ -79,7 +79,7 @@ class Tick:
     btc_last: float            # optional BTC spot feed; 0 in default Polymarket-only live runs
     btc_bid: float             # optional BTC bid; 0 in default Polymarket-only live runs
     btc_ask: float             # optional BTC ask; 0 in default Polymarket-only live runs
-    btc_source: str            # "polymarket", "binance", "binance-us", or "coinbase"
+    btc_source: str            # "polymarket" or "binance"
 
     up_bid: float              # Polymarket UP token best bid (in $0–$1)
     up_ask: float
@@ -235,11 +235,11 @@ python scripts/run_baseline.py --duration 300
 
 The official live path is **Polymarket-only by default**. It discovers the
 active BTC 5-minute event from Gamma and polls Polymarket order books; it does
-not require Binance/Coinbase WebSockets. Evaluators can opt into an auxiliary
-BTC feed with `--price-source binance`, `binance-us`, or `coinbase`. When this
-is enabled, recorded `ticks.parquet` rows contain both Polymarket UP/DOWN
-order-book fields and Binance/Coinbase BTC fields, with `btc_source` naming
-the active BTC feed. The live validator reports `polymarket_valid_rows`
+not require Binance WebSockets. Evaluators can opt into an auxiliary
+BTC feed with `--price-source binance`. When this is enabled, recorded
+`ticks.parquet` rows contain both Polymarket UP/DOWN order-book fields and
+Binance BTC fields, with `btc_source` naming the active BTC feed. The live
+validator reports `polymarket_valid_rows`
 (active rows with usable UP/DOWN mids), `polymarket_two_sided_rows` (both
 bid and ask populated for both tokens), and `polymarket_one_sided_rows`
 (valid rows where one bid/ask is zero, which can happen near resolution).

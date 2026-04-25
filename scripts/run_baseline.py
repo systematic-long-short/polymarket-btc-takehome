@@ -35,7 +35,7 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--fee-rate", type=float, default=0.072,
                    help="Polymarket-style fee coefficient")
     p.add_argument("--price-source", default="polymarket",
-                   choices=["polymarket", "binance", "binance-us", "coinbase"],
+                   choices=["polymarket", "binance"],
                    help="Default 'polymarket' disables external BTC WebSockets.")
     p.add_argument("--output-dir", default=None)
     p.add_argument("--config", default=None)

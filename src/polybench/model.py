@@ -60,7 +60,7 @@ class Tick:
     up_mid_recent: Sequence[float] = field(default_factory=tuple)  # rolling window of up_mid
 
     event_id: str = ""
-    btc_source: str = "polymarket"   # "polymarket", "binance", "binance-us", or "coinbase"
+    btc_source: str = "polymarket"   # "polymarket" or "binance"
 
 
 @dataclass(frozen=True, slots=True)

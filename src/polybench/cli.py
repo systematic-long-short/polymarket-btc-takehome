@@ -174,7 +174,7 @@ def build_parser() -> argparse.ArgumentParser:
                    help="Polymarket-style fee coefficient (0.072 = ~1.8%% at p=0.5)")
     r.add_argument(
         "--price-source",
-        choices=["polymarket", "binance", "binance-us", "coinbase"],
+        choices=["polymarket", "binance"],
         default="polymarket",
         help="Default 'polymarket' disables external BTC WebSockets.",
     )

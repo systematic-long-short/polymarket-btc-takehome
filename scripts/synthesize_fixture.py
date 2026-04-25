@@ -155,7 +155,7 @@ def main(argv: list[str] | None = None) -> int:
                    help="seconds of BTC data to capture (default 600 = 10 min = 2 events)")
     p.add_argument("--output", default="tests/fixtures/recorded_event.parquet")
     p.add_argument("--price-source", default="binance",
-                   choices=["binance", "binance-us", "coinbase"])
+                   choices=["binance"])
     p.add_argument("--event-length", type=int, default=300,
                    help="seconds per synthetic event (default 300 = 5 min)")
     args = p.parse_args(argv)

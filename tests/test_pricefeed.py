@@ -21,3 +21,10 @@ async def test_polymarket_price_source_disables_external_feed() -> None:
         assert snap.window == ()
     finally:
         await feed.stop()
+
+
+def test_unsupported_auxiliary_sources_rejected() -> None:
+    with pytest.raises(ValueError):
+        PriceFeed(source="binance-us")
+    with pytest.raises(ValueError):
+        PriceFeed(source="coinbase")

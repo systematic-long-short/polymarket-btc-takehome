@@ -35,7 +35,7 @@ def main(argv: list[str] | None = None) -> int:
         help="destination parquet path",
     )
     p.add_argument("--price-source", default="polymarket",
-                   choices=["polymarket", "binance", "binance-us", "coinbase"],
+                   choices=["polymarket", "binance"],
                    help="Default 'polymarket' records Polymarket only.")
     p.add_argument(
         "--resolution-timeout",

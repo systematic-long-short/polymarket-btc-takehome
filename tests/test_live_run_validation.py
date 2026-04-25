@@ -140,7 +140,7 @@ def test_validate_live_run_requires_binance_source(
 
     df = pd.read_parquet(synthetic_fixture).iloc[:601].copy()
     df["ts"] = [1_700_000_000.0 + i for i in range(len(df))]
-    df["btc_source"] = "coinbase"
+    df["btc_source"] = "other"
     df.to_parquet(ticks, engine="pyarrow", index=False)
 
     with pytest.raises(AssertionError, match="Binance"):

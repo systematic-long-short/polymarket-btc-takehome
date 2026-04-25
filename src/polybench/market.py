@@ -128,10 +128,9 @@ class EventDescriptor:
     """Raw event data returned by Gamma, plus its per-tick refreshable quotes.
 
     ``best_bid``/``best_ask``/``last_trade`` on the descriptor come from
-    ``markets[0]`` on the Gamma event payload and reflect the UP token.
-    DOWN-token quotes are derived by arbitrage (1 - UP). These fields act as
-    a durable top-of-book source when the CLOB ``/book`` endpoint 404s on a
-    given token id.
+    ``markets[0]`` on the Gamma event payload and reflect the UP token. They
+    are useful for event discovery and resolution context, but paper fills use
+    real CLOB ``/book`` responses only.
     """
 
     event_id: str
@@ -159,47 +158,6 @@ class EventDescriptor:
             down_token_id=self.down_token_id,
             scratch_dir=scratch_dir,
         )
-
-    def synth_up_book(self) -> "Book":
-        """Construct a minimal Book from Gamma's UP-side summary quotes."""
-        import time as _time
-        up_mid = self.outcome_prices[0] if self.outcome_prices[0] > 0 else self.last_trade
-        bid = self.best_bid if self.best_bid > 0 else max(0.0, up_mid - 0.01)
-        ask = self.best_ask if self.best_ask > 0 else min(1.0, up_mid + 0.01)
-        last = self.last_trade if self.last_trade > 0 else (bid + ask) / 2.0 if (bid + ask) > 0 else 0.5
-        bids = (Level(price=bid, size=0.0),) if bid > 0 else ()
-        asks = (Level(price=ask, size=0.0),) if ask > 0 else ()
-        return Book(
-            token_id=self.up_token_id,
-            bids=bids,
-            asks=asks,
-            best_bid=bid,
-            best_ask=ask,
-            last_trade=last,
-            ts=_time.time(),
-        )
-
-    def synth_down_book(self) -> "Book":
-        """Construct a DOWN-token Book by inverting UP via ``1 − p`` arbitrage."""
-        import time as _time
-        up = self.synth_up_book()
-        down_bid = max(0.0, 1.0 - up.best_ask) if up.best_ask > 0 else 0.0
-        down_ask = min(1.0, 1.0 - up.best_bid) if up.best_bid > 0 else 0.0
-        down_last = self.outcome_prices[1] if self.outcome_prices[1] > 0 else (
-            (down_bid + down_ask) / 2.0 if (down_bid + down_ask) > 0 else 0.5
-        )
-        bids = (Level(price=down_bid, size=0.0),) if down_bid > 0 else ()
-        asks = (Level(price=down_ask, size=0.0),) if down_ask > 0 else ()
-        return Book(
-            token_id=self.down_token_id,
-            bids=bids,
-            asks=asks,
-            best_bid=down_bid,
-            best_ask=down_ask,
-            last_trade=down_last,
-            ts=_time.time(),
-        )
-
 
 def _iso_to_ts(iso: str | None) -> float:
     if not iso:
@@ -342,8 +300,11 @@ class PolymarketClient:
         return None
 
     async def get_book(self, token_id: str) -> Book | None:
-        """Fetch a CLOB order book. Returns ``None`` on 404 / empty responses so
-        the harness can fall back to Gamma's top-of-book summary."""
+        """Fetch a CLOB order book.
+
+        Returns ``None`` on 404 / empty responses. The harness treats that as a
+        temporary no-book state and skips paper fills until CLOB returns.
+        """
         import time as _time
 
         try:

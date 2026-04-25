@@ -60,7 +60,9 @@ python scripts/run_baseline.py --model momentum --duration 300
 > canonical slug `btc-updown-5m-<end_ts>` directly from Gamma. When one
 > event resolves it rolls straight to the next, chaining ~12 events per hour
 > during the scoring run. If discovery genuinely fails, the run fails —
-> there is no synthetic or cross-exchange fallback for PnL.
+> there is no synthetic or cross-exchange fallback for PnL. Paper fills use
+> Polymarket CLOB `/book` data only; Gamma is used for event discovery and
+> resolution metadata, not for executable prices.
 >
 > Demo runs stop near the requested `--duration`. If the final event has not
 > resolved yet, it is reported as `UNKNOWN` rather than waiting minutes after
@@ -144,7 +146,8 @@ readers/writers, such as `pandas.read_*`, `numpy.fromfile`, and
 ## The rules
 
 - **Latency budget:** `on_tick` must return within **500 ms** wall-clock.
-  Overruns drop that tick's signal; repeated timeouts tank your score.
+  Overruns drop the signal that would have executed on the next tick; repeated
+  timeouts tank your score.
 - **Max 1 signal per second.** We only sample your return once per tick.
 - **Model state lives on `self`.** No globals, no monkey-patching the
   harness, no mutating the `Tick` / `Signal` / `MarketInfo` dataclasses
@@ -176,17 +179,16 @@ readers/writers, such as `pandas.read_*`, `numpy.fromfile`, and
   the same $100 after a 40% intra-run drawdown.
 
 **How PnL is computed.** PnL is liquidation mark-to-market, tick by tick. When you
-send a signal, the simulator executes the delta against the current
-Polymarket order book:
+send a signal, the simulator queues it and executes the delta against the next
+recorded tick's Polymarket CLOB order book:
 
 - Buys fill at `best_ask × (1 + slippage)` (default slippage 0.5% per order).
 - Sells fill at `best_bid × (1 − slippage)`.
 - Every fill also pays a Polymarket-style fee of
-  `|notional| × fee_rate × p × (1 − p)` where `p` is the fill price in
-  `[0, 1]` and `fee_rate = 0.072` by default. Fee is maximal at
-  `p = 0.5` (~1.8% of notional) and collapses toward zero at the
-  extremes — buying a near-certain outcome costs very little, taking a
-  coin-flip position costs more.
+  `shares × fee_rate × p × (1 − p)` where `p` is the fill price in
+  `[0, 1]` and `fee_rate = 0.072` by default. For example, 100 shares at
+  $0.50 costs $1.80 in fees; the dollar fee decreases symmetrically toward
+  both price extremes.
 
 Your equity each tick is a liquidation mark: cash plus held shares valued
 at the current executable exit bid after slippage and exit fee. A one-sided
@@ -234,10 +236,10 @@ python scripts/run_baseline.py --duration 300
 ```
 
 The official live path is **Polymarket-only by default**. It discovers the
-active BTC 5-minute event from Gamma and polls Polymarket order books; it does
-not require Binance WebSockets. Evaluators can opt into an auxiliary
-BTC feed with `--price-source binance`. When this is enabled, recorded
-`ticks.parquet` rows contain both Polymarket UP/DOWN order-book fields and
+active BTC 5-minute event from Gamma and streams Polymarket CLOB order books for
+fills and marks; it does not require Binance WebSockets. Evaluators can opt
+into an auxiliary BTC feed with `--price-source binance`. When this is
+enabled, recorded `ticks.parquet` rows contain both Polymarket UP/DOWN order-book fields and
 Binance BTC fields, with `btc_source` naming the active BTC feed. The live
 validator reports `polymarket_valid_rows`
 (active rows with usable UP/DOWN mids), `polymarket_two_sided_rows` (both

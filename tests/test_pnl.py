@@ -188,9 +188,7 @@ def test_flat_signal_closes_existing_positions() -> None:
 
 
 def test_fee_is_max_at_p_0_5() -> None:
-    """Per-fill fee = notional * fee_rate * p * (1-p). At p=0.5, p(1-p)=0.25
-    so fee = notional * fee_rate * 0.25. With fee_rate=0.072 that's 1.8% of
-    notional — the worst-case trader friction in the simulator."""
+    """Per-fill fee = shares * fee_rate * p * (1-p). At p=0.5, p(1-p)=0.25."""
     sim = PaperSimulator(starting_capital=1000.0, slippage_bps=0.0, fee_rate=0.072)
     sim.start_event("E1", "ev1", ts=0.0, up_mid=0.5, down_mid=0.5)
     # Book with mid exactly 0.5: bid=0.50, ask=0.50 (no spread, no slippage).
@@ -205,16 +203,15 @@ def test_fee_is_max_at_p_0_5() -> None:
     assert fill.side == Side.UP
     # Target notional = $1000, fill price = $0.50 → target 2000 shares.
     assert fill.shares_delta == pytest.approx(2000.0, rel=1e-9)
-    # Notional = 2000 * 0.50 = $1000. Fee = 1000 * 0.072 * 0.5 * 0.5 = $18.
+    # Notional = 2000 * 0.50 = $1000. Fee = 2000 * 0.072 * 0.5 * 0.5 = $36.
     assert fill.notional == pytest.approx(1000.0, rel=1e-9)
-    assert fill.fee == pytest.approx(18.0, rel=1e-9)
-    # Cash: started $1000, minus $1000 notional, minus $18 fee = -$18.
-    assert sim.position.cash == pytest.approx(-18.0, rel=1e-9)
+    assert fill.fee == pytest.approx(36.0, rel=1e-9)
+    # Cash: started $1000, minus $1000 notional, minus $36 fee = -$36.
+    assert sim.position.cash == pytest.approx(-36.0, rel=1e-9)
 
 
 def test_fee_shrinks_at_extremes() -> None:
-    """At p=0.1, p(1-p)=0.09 → fee = notional * fee_rate * 0.09 ≈ 0.648% of
-    notional. Dramatically smaller than the p=0.5 case."""
+    """At p=0.1, p(1-p)=0.09, so per-share fees are smaller than at p=0.5."""
     sim = PaperSimulator(starting_capital=1000.0, slippage_bps=0.0, fee_rate=0.072)
     sim.start_event("E1", "ev1", ts=0.0, up_mid=0.1, down_mid=0.9)
     book = BookTop(best_bid=0.10, best_ask=0.10, mid=0.10)
@@ -227,9 +224,9 @@ def test_fee_shrinks_at_extremes() -> None:
     fill = fills[0]
     # Target notional = $1000, fill price = $0.10 → target 10000 shares.
     assert fill.shares_delta == pytest.approx(10000.0, rel=1e-9)
-    # Notional = 10000 * 0.10 = $1000. Fee = 1000 * 0.072 * 0.1 * 0.9 = $6.48.
-    assert fill.fee == pytest.approx(6.48, rel=1e-9)
-    assert sim.position.cash == pytest.approx(-6.48, rel=1e-9)
+    # Notional = 10000 * 0.10 = $1000. Fee = 10000 * 0.072 * 0.1 * 0.9 = $64.80.
+    assert fill.fee == pytest.approx(64.8, rel=1e-9)
+    assert sim.position.cash == pytest.approx(-64.8, rel=1e-9)
 
 
 def test_fee_charged_on_both_buy_and_sell() -> None:
@@ -243,9 +240,22 @@ def test_fee_charged_on_both_buy_and_sell() -> None:
     # Close (FLAT)
     sell_fills = sim.apply_signal(Signal(side=Side.FLAT, size=0.0), book, book)
     close_fee = sell_fills[0].fee
-    # Selling 2000 shares at 0.50 → notional $1000 → same fee structure.
-    assert open_fee == pytest.approx(18.0, rel=1e-9)
-    assert close_fee == pytest.approx(18.0, rel=1e-9)
+    # Selling 2000 shares at 0.50 charges the same per-share fee.
+    assert open_fee == pytest.approx(36.0, rel=1e-9)
+    assert close_fee == pytest.approx(36.0, rel=1e-9)
+
+
+def test_mark_to_market_subtracts_share_based_exit_fee() -> None:
+    sim = PaperSimulator(starting_capital=0.0, slippage_bps=0.0, fee_rate=0.072)
+    sim.position.up_shares = 100.0
+    sim.start_event("E1", "ev1", ts=0.0, up_mid=0.5, down_mid=0.5)
+
+    equity = sim.mark_to_market(
+        BookTop(best_bid=0.50, best_ask=0.50, mid=0.50),
+        BookTop(best_bid=0.49, best_ask=0.51, mid=0.50),
+    )
+
+    assert equity == pytest.approx(48.2, rel=1e-9)
 
 
 def test_one_sided_book_rejects_fills() -> None:

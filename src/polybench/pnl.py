@@ -4,7 +4,7 @@ Pipeline for a single event:
     simulator.start_event(starting_equity_snapshot)
     while event trading:
         book_up, book_down = latest CLOB books
-        fill = simulator.apply_signal(signal, book_up, book_down)   # executes diff
+        fill = simulator.apply_signal(signal, book_up, book_down)   # executes target diff
         equity = simulator.mark_to_market(book_up, book_down)
     simulator.finish_event(resolved_up_price, resolved_down_price)
 
@@ -113,7 +113,7 @@ class PaperSimulator:
         self,
         starting_capital: float = 1000.0,
         slippage_bps: float = 50.0,    # 0.5% = 50 basis points per order
-        fee_rate: float = 0.072,        # Polymarket-style per-trade fee coefficient
+        fee_rate: float = 0.072,        # Polymarket-style per-share fee coefficient
     ) -> None:
         self._starting_capital = float(starting_capital)
         self._slippage = float(slippage_bps) / 10_000.0
@@ -283,7 +283,8 @@ class PaperSimulator:
             return 0.0
         fill_price = book.best_bid * (1.0 - self._slippage)
         p = max(0.0, min(1.0, fill_price))
-        return max(0.0, fill_price * (1.0 - self._fee_rate * p * (1.0 - p)))
+        per_share_fee = self._fee_rate * p * (1.0 - p)
+        return max(0.0, fill_price - per_share_fee)
 
     def _target_shares(
         self, signal: Signal, up_book: BookTop, down_book: BookTop
@@ -342,12 +343,11 @@ class PaperSimulator:
                 return None
             fill_price = book.best_bid * (1.0 - self._slippage)
             notional = delta * fill_price                 # cash in (negative notional)
-        # Polymarket-style fee: fee = |notional| * fee_rate * p * (1-p) where
-        # p = fill_price. Peaks at p=0.5 (maximum uncertainty), near-zero at
-        # the extremes. Always positive; deducted from cash on top of notional.
-        abs_notional = abs(notional)
+        # Polymarket-style taker fee: fee = shares * fee_rate * p * (1-p)
+        # where p = fill_price. Always positive; deducted from cash on top of
+        # notional.
         p = max(0.0, min(1.0, fill_price))
-        fee = abs_notional * self._fee_rate * p * (1.0 - p)
+        fee = abs(delta) * self._fee_rate * p * (1.0 - p)
         return Fill(
             side=side,
             shares_delta=delta,

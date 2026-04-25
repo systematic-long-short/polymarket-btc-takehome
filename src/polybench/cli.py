@@ -171,7 +171,7 @@ def build_parser() -> argparse.ArgumentParser:
     r.add_argument("--starting-capital", type=float, default=1000.0)
     r.add_argument("--slippage-bps", type=float, default=50.0, help="Default 50 = 0.5%% per order")
     r.add_argument("--fee-rate", type=float, default=0.072,
-                   help="Polymarket-style fee coefficient (0.072 = ~1.8%% at p=0.5)")
+                   help="Polymarket-style per-share fee coefficient")
     r.add_argument(
         "--price-source",
         choices=["polymarket", "binance"],

@@ -2,6 +2,7 @@
 
 Reads a parquet tick log recorded by the live harness (see ``recorder.py``),
 reconstructs ``Tick`` objects, and feeds them into a fresh ``Model`` instance.
+Signals execute on the next recorded tick, matching the live harness.
 Deterministic, no network. Intended for rapid iteration on candidate code.
 """
 
@@ -72,6 +73,8 @@ def replay(
     equity_curve: list[float] = []
     baseline_equity_curve: list[float] = []
     current_event: str | None = None
+    pending_signal: Signal | None = None
+    baseline_pending_signal: Signal | None = None
 
     started_ts = float(df["ts"].iloc[0])
 
@@ -109,6 +112,8 @@ def replay(
                 simulator.finish_event(float(row.ts), None, None)
                 baseline_simulator.finish_event(float(row.ts), None, None)
             current_event = event_id
+            pending_signal = None
+            baseline_pending_signal = None
             up_mid_window.clear()
             simulator.start_event(
                 event_id=event_id,
@@ -148,6 +153,8 @@ def replay(
             simulator.finish_event(float(row.ts), up_price, down_price)
             baseline_simulator.finish_event(float(row.ts), up_price, down_price)
             current_event = None
+            pending_signal = None
+            baseline_pending_signal = None
             continue
 
         # Update rolling windows from the recorded row.
@@ -177,17 +184,17 @@ def replay(
             btc_source=btc_source,
         )
 
-        signal_out = _safe_on_tick(model, tick)
-        baseline_signal_out = _safe_on_tick(baseline_model, tick)
-
         up_top = BookTop(best_bid=tick.up_bid, best_ask=tick.up_ask, mid=tick.up_mid)
         down_top = BookTop(best_bid=tick.down_bid, best_ask=tick.down_ask, mid=tick.down_mid)
-        simulator.apply_signal(signal_out, up_top, down_top)
+        simulator.apply_signal(pending_signal, up_top, down_top)
         equity = simulator.mark_to_market(up_top, down_top, tick.ts)
         equity_curve.append(equity)
-        baseline_simulator.apply_signal(baseline_signal_out, up_top, down_top)
+        baseline_simulator.apply_signal(baseline_pending_signal, up_top, down_top)
         baseline_equity = baseline_simulator.mark_to_market(up_top, down_top, tick.ts)
         baseline_equity_curve.append(baseline_equity)
+
+        pending_signal = _safe_on_tick(model, tick)
+        baseline_pending_signal = _safe_on_tick(baseline_model, tick)
 
     # Close dangling event if any (unresolved at EOF).
     if current_event is not None:

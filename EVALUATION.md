@@ -17,7 +17,8 @@ produces the apples-to-apples Model-vs-Baseline comparison.
 
 Use the default `--price-source polymarket` unless you are intentionally
 debugging an auxiliary BTC spot feed. Official scoring should depend only on
-Polymarket Gamma/CLOB availability.
+Polymarket Gamma/CLOB availability. Gamma discovers and resolves events; fills
+and marks require live CLOB WebSocket books for both UP and DOWN tokens.
 
 ```bash
 # Set up a fresh working dir per candidate.
@@ -107,7 +108,7 @@ A submission **fails fast** if:
   predicts Polymarket mid-drift" is a testable hypothesis. "A neural net
   learned the pattern" is not.
 - Do they acknowledge spread + slippage + fees? The default 0.5% per-order slippage
-  plus up-to-1.8% fee at p=0.5 adds up; a frequently-trading strategy
+  plus Polymarket's per-share taker fee adds up; a frequently-trading strategy
   needs signal strong enough to overcome it.
 - Do they describe the failure mode? If BTC goes flat, what does their
   signal do? How did they validate this?

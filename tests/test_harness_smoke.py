@@ -7,12 +7,16 @@ without touching the network.
 from __future__ import annotations
 
 import asyncio
+import json
 import math
 from pathlib import Path
+
+import pytest
 
 from polybench import FLAT, Model, Side, Signal, Tick
 from polybench.baselines import MomentumBaseline
 from polybench.harness import Harness, HarnessConfig
+from polybench.market import Book, EventDescriptor, Level
 from polybench.replay import ReplayConfig, replay
 
 
@@ -38,6 +42,18 @@ class _FlatModel(Model):
         return FLAT
 
 
+class _UpThenFlatModel(Model):
+    def __init__(self) -> None:
+        super().__init__()
+        self.calls = 0
+
+    def on_tick(self, tick: Tick) -> Signal | None:
+        self.calls += 1
+        if self.calls == 1:
+            return Signal(side=Side.UP, size=1.0)
+        return FLAT
+
+
 class _InvalidSignalModel(Model):
     def on_tick(self, tick: Tick) -> Signal | None:
         return Signal(side="BAD", size="not-a-number")  # type: ignore[arg-type]
@@ -50,6 +66,37 @@ class _RefreshCountingClient:
     async def refresh_event(self, slug: str):
         self.refresh_calls += 1
         return None
+
+
+class _MissingBookClient:
+    async def get_book(self, token_id: str):
+        return None
+
+
+def _event() -> EventDescriptor:
+    return EventDescriptor(
+        event_id="E1",
+        slug="btc-updown-test",
+        question="q",
+        end_date_ts=300.0,
+        up_token_id="UP",
+        down_token_id="DOWN",
+        up_outcome_label="Up",
+        down_outcome_label="Down",
+        outcome_prices=(0.5, 0.5),
+    )
+
+
+def _book_obj(token_id: str, bid: float, ask: float, ts: float = 0.0) -> Book:
+    return Book(
+        token_id=token_id,
+        bids=(Level(price=bid, size=100.0),),
+        asks=(Level(price=ask, size=100.0),),
+        best_bid=bid,
+        best_ask=ask,
+        last_trade=(bid + ask) / 2.0,
+        ts=ts,
+    )
 
 
 def _tick() -> Tick:
@@ -161,5 +208,96 @@ def test_postmortem_resolution_disabled_skips_gamma_refresh(tmp_path: Path) -> N
 
         asyncio.run(harness._postmortem_resolve_unknowns(max_wait_s=0.0, poll_interval_s=0.0))
         assert client.refresh_calls == 0
+    finally:
+        harness._executor.shutdown(wait=False, cancel_futures=True)
+
+
+def test_live_harness_executes_signal_on_next_tick(tmp_path: Path) -> None:
+    model = _UpThenFlatModel()
+    event = _event()
+    harness = Harness(
+        model,
+        HarnessConfig(
+            output_dir=tmp_path / "out",
+            slippage_bps=0.0,
+            fee_rate=0.0,
+        ),
+        baseline_model=_FlatModel(),
+    )
+    try:
+        harness._current_event = event
+        harness._cached_up_book = _book_obj("UP", 0.49, 0.50, ts=1.0)
+        harness._cached_down_book = _book_obj("DOWN", 0.49, 0.50, ts=1.0)
+        harness._on_event_start(event, now=0.0)
+
+        asyncio.run(harness._dispatch_tick(1.0))
+        assert harness._simulator.position.up_shares == 0.0
+        assert harness._recorder._rows[-1]["fills_this_tick"] == 0
+
+        harness._cached_up_book = _book_obj("UP", 0.59, 0.60, ts=2.0)
+        harness._cached_down_book = _book_obj("DOWN", 0.39, 0.40, ts=2.0)
+        asyncio.run(harness._dispatch_tick(2.0))
+
+        assert harness._simulator.position.up_shares == pytest.approx(1000.0 / 0.60)
+        assert harness._recorder._rows[-1]["fills_this_tick"] == 1
+    finally:
+        harness._executor.shutdown(wait=False, cancel_futures=True)
+
+
+def test_prime_books_requires_real_clob_books(tmp_path: Path) -> None:
+    harness = Harness(
+        _FlatModel(),
+        HarnessConfig(output_dir=tmp_path / "out"),
+        client=_MissingBookClient(),  # type: ignore[arg-type]
+        baseline_model=_FlatModel(),
+    )
+    try:
+        ready = asyncio.run(harness._prime_books_for(_event()))
+        assert ready is False
+        assert harness._cached_up_book is None
+        assert harness._cached_down_book is None
+    finally:
+        harness._executor.shutdown(wait=False, cancel_futures=True)
+
+
+def test_clob_websocket_payload_updates_real_book_cache(tmp_path: Path) -> None:
+    event = _event()
+    harness = Harness(
+        _FlatModel(),
+        HarnessConfig(output_dir=tmp_path / "out"),
+        baseline_model=_FlatModel(),
+    )
+    try:
+        harness._apply_clob_ws_payload(
+            event,
+            json.dumps(
+                {
+                    "event_type": "book",
+                    "asset_id": "UP",
+                    "bids": [{"price": "0.48", "size": "10"}],
+                    "asks": [{"price": "0.52", "size": "12"}],
+                    "timestamp": "1766789469958",
+                }
+            ),
+        )
+        harness._apply_clob_ws_payload(
+            event,
+            json.dumps(
+                {
+                    "event_type": "best_bid_ask",
+                    "asset_id": "DOWN",
+                    "best_bid": "0.47",
+                    "best_ask": "0.53",
+                    "timestamp": "1766789469959",
+                }
+            ),
+        )
+
+        assert harness._cached_up_book is not None
+        assert harness._cached_up_book.best_bid == pytest.approx(0.48)
+        assert harness._cached_up_book.best_ask == pytest.approx(0.52)
+        assert harness._cached_down_book is not None
+        assert harness._cached_down_book.best_bid == pytest.approx(0.47)
+        assert harness._cached_down_book.best_ask == pytest.approx(0.53)
     finally:
         harness._executor.shutdown(wait=False, cancel_futures=True)

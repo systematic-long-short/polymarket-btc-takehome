@@ -15,10 +15,10 @@ Schema (one row per tick):
     down_bid             float64
     down_ask             float64
     down_mid             float64
-    signal_side          string    "UP" | "DOWN" | "FLAT" | "NONE"
+    signal_side          string    "UP" | "DOWN" | "FLAT" | "NONE" queued for next tick
     signal_size          float64
     signal_confidence    float64
-    position_up          float64   shares held after applying signal
+    position_up          float64   shares held after applying prior tick's signal
     position_down        float64
     cash                 float64
     equity               float64

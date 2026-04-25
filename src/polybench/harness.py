@@ -4,14 +4,14 @@ Polymarket 5-minute BTC up/down events.
 Architecture (single asyncio event loop):
 
     pricefeed task    — optional BTC feed; disabled in default Polymarket-only mode
-    clob_poller task  — 1 Hz REST poll of UP+DOWN order books, cached
+    clob_ws task      — public Polymarket CLOB market WebSocket, cached
     event_watcher     — called from main loop: find next event when idle, detect resolution
-    tick_loop (main)  — 1 Hz, assembles Tick, calls on_tick (500 ms budget),
-                        applies signal through simulator, records row
+    tick_loop (main)  — 1 Hz, assembles Tick, applies the prior tick's signal
+                        through simulator, calls on_tick (500 ms budget), records row
 
 Model's ``on_tick`` is synchronous and runs on a ThreadPoolExecutor with a
 500 ms ``asyncio.wait_for`` timeout. Overruns are logged as timeouts and the
-signal is dropped for that tick (no stale-signal carry-forward).
+signal is dropped for the next tick (no stale-signal carry-forward).
 """
 
 from __future__ import annotations
@@ -28,7 +28,9 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
 
-from polybench.market import Book, EventDescriptor, PolymarketClient
+import websockets
+
+from polybench.market import Book, EventDescriptor, Level, PolymarketClient
 from polybench.metrics import summarize
 from polybench.model import FLAT, MarketInfo, Model, RunResult, Side, Signal, Tick
 from polybench.pnl import BookTop, PaperSimulator
@@ -41,6 +43,8 @@ log = logging.getLogger("polybench.harness")
 DEFAULT_TICK_INTERVAL_S = 1.0
 DEFAULT_MODEL_BUDGET_S = 0.5
 DEFAULT_CLOB_POLL_INTERVAL_S = 1.0
+DEFAULT_CLOB_WS_STALE_AFTER_S = 30.0
+CLOB_MARKET_WS_URL = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
 RESOLUTION_POLL_TIMEOUT_S = 45.0   # short live poll; postmortem pass catches lagging resolutions
 RESOLUTION_POLL_INTERVAL_S = 2.0
 EVENT_DISCOVERY_INTERVAL_S = 3.0   # probe Gamma every 3s while idle
@@ -53,12 +57,14 @@ class HarnessConfig:
     tick_interval_s: float = DEFAULT_TICK_INTERVAL_S
     model_budget_s: float = DEFAULT_MODEL_BUDGET_S
     clob_poll_interval_s: float = DEFAULT_CLOB_POLL_INTERVAL_S
+    clob_ws_stale_after_s: float = DEFAULT_CLOB_WS_STALE_AFTER_S
+    clob_ws_url: str = CLOB_MARKET_WS_URL
     resolution_poll_timeout_s: float = RESOLUTION_POLL_TIMEOUT_S
     postmortem_resolution_s: float = 0.0
     postmortem_poll_interval_s: float = 10.0
     starting_capital: float = 1000.0
     slippage_bps: float = 50.0
-    fee_rate: float = 0.072   # Polymarket-style per-trade fee coefficient
+    fee_rate: float = 0.072   # Polymarket-style per-share fee coefficient
     price_source: str = "polymarket"
     price_window_size: int = 300
     output_dir: Path = Path("runs/latest")
@@ -118,6 +124,8 @@ class Harness:
         self._executor = ThreadPoolExecutor(
             max_workers=4, thread_name_prefix="polybench-model"
         )
+        self._pending_signal: Signal | None = None
+        self._baseline_pending_signal: Signal | None = None
 
     # ---- public ----
 
@@ -125,7 +133,7 @@ class Harness:
         started_ts = time.time()
         await self._pricefeed.start()
         await self._pricefeed.wait_ready(timeout=15.0)
-        self._clob_task = asyncio.create_task(self._clob_poll_loop(), name="polybench-clob")
+        self._clob_task = asyncio.create_task(self._clob_poll_loop(), name="polybench-clob-ws")
         try:
             await self._tick_loop(started_ts)
         finally:
@@ -184,8 +192,11 @@ class Harness:
                     await asyncio.sleep(min(EVENT_DISCOVERY_INTERVAL_S, max(0.1, deadline - now)))
                     next_tick = time.time()
                     continue
+                if not await self._prime_books_for(discovered):
+                    await asyncio.sleep(min(1.0, max(0.1, deadline - now)))
+                    next_tick = time.time()
+                    continue
                 self._current_event = discovered
-                await self._prime_books_for(discovered)
                 self._on_event_start(discovered, now)
                 next_tick = time.time()
 
@@ -209,43 +220,83 @@ class Harness:
                 await asyncio.sleep(sleep_for)
 
     async def _clob_poll_loop(self) -> None:
-        """Keep order books fresh.
-
-        Every interval: (a) refresh the Gamma event to pick up updated best_bid/
-        best_ask/outcome_prices, (b) try CLOB /book for each token, (c) fall back
-        to Gamma-synthesized top-of-book when CLOB returns None/empty. Guarantees
-        the tick loop always sees a non-empty book during a live event.
-        """
+        """Keep order books fresh from the public Polymarket CLOB WebSocket."""
+        backoff_s = 0.5
         while not self._stop.is_set():
             event = self._current_event
             if event is None:
                 await asyncio.sleep(0.5)
                 continue
-            # Refresh Gamma view of the event (best_bid/best_ask/outcome_prices).
             try:
-                refreshed = await self._client.refresh_event(event.slug)
-                if refreshed is not None:
-                    self._current_event = refreshed
-                    event = refreshed
+                await self._stream_clob_books(event)
+                backoff_s = 0.5
+            except asyncio.CancelledError:
+                raise
             except Exception as exc:  # noqa: BLE001
-                log.debug("gamma refresh failed for %s: %s", event.slug, exc)
-            # Attempt CLOB depth; on miss, use Gamma summary.
-            up_book: Book | None = None
-            down_book: Book | None = None
-            try:
-                up_book, down_book = await asyncio.gather(
-                    self._client.get_book(event.up_token_id),
-                    self._client.get_book(event.down_token_id),
+                self._cached_up_book = None
+                self._cached_down_book = None
+                log.warning(
+                    "CLOB WebSocket for %s stopped (%s); reconnecting in %.1fs",
+                    event.slug,
+                    exc,
+                    backoff_s,
                 )
-            except Exception as exc:  # noqa: BLE001
-                log.warning("clob poll errored (will use Gamma summary): %s", exc)
-            if up_book is None:
-                up_book = event.synth_up_book()
-            if down_book is None:
-                down_book = event.synth_down_book()
-            self._cached_up_book = up_book
-            self._cached_down_book = down_book
-            await asyncio.sleep(self._cfg.clob_poll_interval_s)
+                await asyncio.sleep(backoff_s)
+                backoff_s = min(backoff_s * 2.0, 8.0)
+
+    async def _stream_clob_books(self, event: EventDescriptor) -> None:
+        subscribe = {
+            "assets_ids": [event.up_token_id, event.down_token_id],
+            "type": "market",
+            "custom_feature_enabled": True,
+        }
+        async with websockets.connect(
+            self._cfg.clob_ws_url,
+            ping_interval=20,
+            ping_timeout=10,
+            close_timeout=5,
+        ) as ws:
+            await ws.send(json.dumps(subscribe))
+            log.info("CLOB WebSocket subscribed for %s", event.slug)
+            while not self._stop.is_set() and self._current_event is not None:
+                current = self._current_event
+                if (
+                    current.event_id != event.event_id
+                    or current.up_token_id != event.up_token_id
+                    or current.down_token_id != event.down_token_id
+                ):
+                    return
+                try:
+                    raw = await asyncio.wait_for(
+                        ws.recv(), timeout=self._cfg.clob_ws_stale_after_s
+                    )
+                except asyncio.TimeoutError as exc:
+                    raise RuntimeError(
+                        f"no CLOB WebSocket message for {self._cfg.clob_ws_stale_after_s:.1f}s"
+                    ) from exc
+                self._apply_clob_ws_payload(event, raw)
+
+    def _apply_clob_ws_payload(self, event: EventDescriptor, raw: str | bytes) -> None:
+        if isinstance(raw, bytes):
+            raw = raw.decode("utf-8", errors="replace")
+        text = raw.strip()
+        if not text or text.upper() in {"PING", "PONG"}:
+            return
+        try:
+            payload = json.loads(text)
+        except json.JSONDecodeError:
+            log.debug("ignored non-JSON CLOB WebSocket payload: %r", text[:80])
+            return
+
+        messages = payload if isinstance(payload, list) else [payload]
+        for msg in messages:
+            if not isinstance(msg, dict):
+                continue
+            for token_id, book in _books_from_clob_ws_message(msg):
+                if token_id == event.up_token_id:
+                    self._cached_up_book = book
+                elif token_id == event.down_token_id:
+                    self._cached_down_book = book
 
     async def _discover_event(self, now: float) -> EventDescriptor | None:
         try:
@@ -265,10 +316,10 @@ class Harness:
         )
         return event
 
-    async def _prime_books_for(self, event: EventDescriptor) -> None:
+    async def _prime_books_for(self, event: EventDescriptor) -> bool:
         """Seed the book cache immediately so the first tick has data.
 
-        Falls back to Gamma-synthesized top-of-book if CLOB 404s.
+        Returns False if Polymarket CLOB does not provide both books yet.
         """
         up_book: Book | None = None
         down_book: Book | None = None
@@ -278,17 +329,21 @@ class Harness:
                 self._client.get_book(event.down_token_id),
             )
         except Exception as exc:  # noqa: BLE001
-            log.warning("failed to prime CLOB books for %s (using Gamma): %s", event.slug, exc)
-        if up_book is None:
-            up_book = event.synth_up_book()
-        if down_book is None:
-            down_book = event.synth_down_book()
+            log.warning("failed to prime CLOB books for %s: %s", event.slug, exc)
+        if up_book is None or down_book is None:
+            self._cached_up_book = None
+            self._cached_down_book = None
+            log.warning("CLOB books not ready for %s; waiting before event start", event.slug)
+            return False
         self._cached_up_book = up_book
         self._cached_down_book = down_book
+        return True
 
     def _on_event_start(self, event: EventDescriptor, now: float) -> None:
         self._up_mid_window.clear()
         self._btc_1hz_window.clear()
+        self._pending_signal = None
+        self._baseline_pending_signal = None
         up_mid = self._cached_up_book.mid if self._cached_up_book else 0.5
         down_mid = self._cached_down_book.mid if self._cached_down_book else 0.5
         self._simulator.start_event(
@@ -501,7 +556,10 @@ class Harness:
         self._current_event = None
         self._cached_up_book = None
         self._cached_down_book = None
+        self._pending_signal = None
+        self._baseline_pending_signal = None
         self._up_mid_window.clear()
+        self._btc_1hz_window.clear()
         log.info(
             "event %s closed: model=%.4f (intra=%.4f, reso=%.4f) baseline=%.4f outcome=%s",
             event.slug,
@@ -515,7 +573,7 @@ class Harness:
     async def _dispatch_tick(self, now: float) -> None:
         assert self._current_event is not None
         if self._cached_up_book is None or self._cached_down_book is None:
-            # No books yet — skip tick but count it.
+            # No real CLOB books yet, so no model call or paper fill is recorded.
             return
 
         up_book = self._cached_up_book
@@ -550,7 +608,27 @@ class Harness:
             event_id=self._current_event.event_id,
         )
 
+        up_top = BookTop(
+            best_bid=up_book.best_bid,
+            best_ask=up_book.best_ask,
+            mid=up_book.mid,
+        )
+        down_top = BookTop(
+            best_bid=down_book.best_bid, best_ask=down_book.best_ask, mid=down_book.mid
+        )
+        fills = self._simulator.apply_signal(self._pending_signal, up_top, down_top)
+        equity = self._simulator.mark_to_market(up_top, down_top, now)
+        self._equity_curve.append(equity)
+        baseline_fills = self._baseline_simulator.apply_signal(
+            self._baseline_pending_signal, up_top, down_top
+        )
+        baseline_equity = self._baseline_simulator.mark_to_market(
+            up_top, down_top, now
+        )
+        self._baseline_equity_curve.append(baseline_equity)
+
         # Run BOTH models against the same tick in parallel (same deadline).
+        # Returned signals are queued for execution on the next recorded tick.
         (signal, timed_out), (baseline_signal, baseline_timed_out) = await asyncio.gather(
             self._call_model_with_budget(self._model, tick),
             self._call_model_with_budget(self._baseline_model, tick),
@@ -559,17 +637,8 @@ class Harness:
             self._simulator.record_timeout()
         if baseline_timed_out:
             self._baseline_simulator.record_timeout()
-
-        up_top = BookTop(best_bid=up_book.best_bid, best_ask=up_book.best_ask, mid=up_book.mid)
-        down_top = BookTop(
-            best_bid=down_book.best_bid, best_ask=down_book.best_ask, mid=down_book.mid
-        )
-        fills = self._simulator.apply_signal(signal, up_top, down_top)
-        equity = self._simulator.mark_to_market(up_top, down_top, now)
-        self._equity_curve.append(equity)
-        baseline_fills = self._baseline_simulator.apply_signal(baseline_signal, up_top, down_top)
-        baseline_equity = self._baseline_simulator.mark_to_market(up_top, down_top, now)
-        self._baseline_equity_curve.append(baseline_equity)
+        self._pending_signal = signal
+        self._baseline_pending_signal = baseline_signal
 
         effective = signal or FLAT
         baseline_effective = baseline_signal or FLAT
@@ -722,6 +791,139 @@ class Harness:
         }
         report_path.write_text(json.dumps(payload, indent=2, default=_json_default))
         log.info("wrote %s", report_path)
+
+
+def _books_from_clob_ws_message(msg: dict[str, Any]) -> list[tuple[str, Book]]:
+    event_type = str(msg.get("event_type") or msg.get("type") or "")
+    ts = _ws_timestamp_to_seconds(msg.get("timestamp"))
+    if event_type == "book":
+        token_id = str(msg.get("asset_id") or "")
+        book = _book_from_levels(token_id, msg.get("bids"), msg.get("asks"), ts=ts)
+        return [(token_id, book)] if book is not None else []
+    if event_type == "best_bid_ask":
+        token_id = str(msg.get("asset_id") or "")
+        book = _book_from_top(
+            token_id,
+            best_bid=_float_or_zero(msg.get("best_bid")),
+            best_ask=_float_or_zero(msg.get("best_ask")),
+            ts=ts,
+        )
+        return [(token_id, book)] if book is not None else []
+    if event_type == "price_change":
+        books: list[tuple[str, Book]] = []
+        for change in msg.get("price_changes") or []:
+            if not isinstance(change, dict):
+                continue
+            token_id = str(change.get("asset_id") or "")
+            book = _book_from_top(
+                token_id,
+                best_bid=_float_or_zero(change.get("best_bid")),
+                best_ask=_float_or_zero(change.get("best_ask")),
+                ts=ts,
+            )
+            if book is not None:
+                books.append((token_id, book))
+        return books
+    return []
+
+
+def _book_from_levels(
+    token_id: str,
+    bids_raw: Any,
+    asks_raw: Any,
+    *,
+    ts: float,
+) -> Book | None:
+    if not token_id:
+        return None
+    bids = tuple(
+        sorted(
+            (
+                Level(
+                    price=_float_or_zero(level.get("price")),
+                    size=_float_or_zero(level.get("size")),
+                )
+                for level in (bids_raw or [])
+                if isinstance(level, dict)
+            ),
+            key=lambda level: -level.price,
+        )
+    )
+    asks = tuple(
+        sorted(
+            (
+                Level(
+                    price=_float_or_zero(level.get("price")),
+                    size=_float_or_zero(level.get("size")),
+                )
+                for level in (asks_raw or [])
+                if isinstance(level, dict)
+            ),
+            key=lambda level: level.price,
+        )
+    )
+    best_bid = bids[0].price if bids else 0.0
+    best_ask = asks[0].price if asks else 0.0
+    if best_bid <= 0.0 and best_ask <= 0.0:
+        return None
+    last_trade = (
+        (best_bid + best_ask) / 2.0
+        if best_bid > 0.0 and best_ask > 0.0
+        else max(best_bid, best_ask)
+    )
+    return Book(
+        token_id=token_id,
+        bids=bids,
+        asks=asks,
+        best_bid=best_bid,
+        best_ask=best_ask,
+        last_trade=last_trade,
+        ts=ts,
+    )
+
+
+def _book_from_top(
+    token_id: str, *, best_bid: float, best_ask: float, ts: float
+) -> Book | None:
+    if not token_id:
+        return None
+    if best_bid <= 0.0 and best_ask <= 0.0:
+        return None
+    bids = (Level(price=best_bid, size=0.0),) if best_bid > 0.0 else ()
+    asks = (Level(price=best_ask, size=0.0),) if best_ask > 0.0 else ()
+    last_trade = (
+        (best_bid + best_ask) / 2.0
+        if best_bid > 0.0 and best_ask > 0.0
+        else max(best_bid, best_ask)
+    )
+    return Book(
+        token_id=token_id,
+        bids=bids,
+        asks=asks,
+        best_bid=best_bid,
+        best_ask=best_ask,
+        last_trade=last_trade,
+        ts=ts,
+    )
+
+
+def _float_or_zero(value: Any) -> float:
+    try:
+        f = float(value)
+    except (TypeError, ValueError):
+        return 0.0
+    if not math.isfinite(f):
+        return 0.0
+    return f
+
+
+def _ws_timestamp_to_seconds(value: Any) -> float:
+    ts = _float_or_zero(value)
+    if ts <= 0.0:
+        return time.time()
+    if ts > 10_000_000_000.0:
+        return ts / 1000.0
+    return ts
 
 
 def _json_default(obj: Any) -> Any:

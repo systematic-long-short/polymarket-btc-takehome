@@ -311,7 +311,7 @@ async def test_refresh_event_returns_fresh_descriptor() -> None:
 
 @pytest.mark.asyncio
 async def test_get_book_returns_none_on_404() -> None:
-    """CLOB 404 must return None so the harness can fall back to Gamma summary."""
+    """CLOB 404 returns None so the harness can wait for real books."""
     def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(404, json={"error": "not found"})
 
@@ -339,25 +339,6 @@ async def test_get_book_returns_none_on_empty_payload() -> None:
         assert book is None
     finally:
         await client.aclose()
-
-
-def test_descriptor_synth_up_down_books_are_complementary() -> None:
-    """UP bid/ask + DOWN bid/ask should sum to ~1 via 1 − p arbitrage."""
-    from polybench.market import EventDescriptor
-
-    desc = EventDescriptor(
-        event_id="E", slug="btc-updown-5m-x", question="q",
-        end_date_ts=9e10, up_token_id="UP", down_token_id="DOWN",
-        up_outcome_label="Up", down_outcome_label="Down",
-        best_bid=0.48, best_ask=0.52, last_trade=0.50,
-        outcome_prices=(0.50, 0.50),
-    )
-    up = desc.synth_up_book()
-    down = desc.synth_down_book()
-    assert up.best_bid == 0.48 and up.best_ask == 0.52
-    assert down.best_bid == pytest.approx(1 - 0.52, abs=1e-9)
-    assert down.best_ask == pytest.approx(1 - 0.48, abs=1e-9)
-
 
 @pytest.mark.asyncio
 async def test_get_book_returns_parsed_book() -> None:
